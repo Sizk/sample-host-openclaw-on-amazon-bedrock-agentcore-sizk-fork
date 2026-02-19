@@ -209,17 +209,9 @@ openclaw-on-agentcore/
     agentcore-contract.js         # AgentCore HTTP contract (/ping, /invocations)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue in VPC
-  agent/
-    my_agent.py                   # Strands Agent with Memory (not used in current mode)
-    Dockerfile                    # Agent container image
-    requirements.txt              # Agent Python deps
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     keepalive/index.py            # Runtime keepalive invoker
-  scripts/
-    deploy.sh                     # Deployment helper script
-    rotate-token.sh               # Gateway token rotation
-    test-e2e.js                   # WebSocket e2e test
   docs/
     architecture.md               # Detailed architecture diagram
 ```
