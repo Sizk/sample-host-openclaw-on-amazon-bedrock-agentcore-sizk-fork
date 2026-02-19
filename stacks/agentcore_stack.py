@@ -1,4 +1,11 @@
-"""AgentCore Stack — Runtime, RuntimeEndpoint, Memory, ECR repo, and agent IAM role."""
+"""AgentCore Stack — Hosts OpenClaw on AgentCore Runtime.
+
+Deploys the OpenClaw messaging bridge as a container on AgentCore Runtime,
+replacing Fargate. The container runs OpenClaw (Telegram/Discord/Slack),
+a Bedrock proxy, and an AgentCore contract server on port 8080.
+
+Also provisions AgentCore Memory for conversation persistence.
+"""
 
 from aws_cdk import (
     CfnOutput,
@@ -24,6 +31,9 @@ class AgentCoreStack(Stack):
         private_subnet_ids: list[str],
         cognito_issuer_url: str,
         cognito_client_id: str,
+        cognito_user_pool_id: str,
+        cognito_password_secret_name: str,
+        gateway_token_secret_name: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -31,17 +41,17 @@ class AgentCoreStack(Stack):
         region = Stack.of(self).region
         account = Stack.of(self).account
 
-        # --- ECR Repository for Agent image -------------------------------
-        self.agent_repo = ecr.Repository(
+        # --- ECR Repository for OpenClaw bridge image -------------------------
+        self.bridge_repo = ecr.Repository(
             self,
-            "AgentRepo",
-            repository_name="openclaw-agent",
+            "BridgeRepo",
+            repository_name="openclaw-bridge",
             removal_policy=RemovalPolicy.DESTROY,
             empty_on_delete=True,
             image_scan_on_push=True,
         )
 
-        # --- Security Group for AgentCore Runtime containers --------------
+        # --- Security Group for AgentCore Runtime containers ------------------
         self.agent_sg = ec2.SecurityGroup(
             self,
             "AgentRuntimeSecurityGroup",
@@ -49,18 +59,17 @@ class AgentCoreStack(Stack):
             description="AgentCore Runtime container security group",
             allow_all_outbound=True,
         )
-        # Allow HTTPS from VPC (for VPC endpoints)
         self.agent_sg.add_ingress_rule(
             peer=ec2.Peer.ipv4(vpc.vpc_cidr_block),
             connection=ec2.Port.tcp(443),
             description="HTTPS from VPC",
         )
 
-        # --- Agent Execution Role -----------------------------------------
-        self.agent_role = iam.Role(
+        # --- Execution Role (what the container can do) -----------------------
+        self.execution_role = iam.Role(
             self,
-            "AgentExecutionRole",
-            role_name="openclaw-agent-execution-role",
+            "OpenClawExecutionRole",
+            role_name="openclaw-agentcore-execution-role",
             assumed_by=iam.CompositePrincipal(
                 iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
                 iam.ServicePrincipal("bedrock.amazonaws.com"),
@@ -68,22 +77,58 @@ class AgentCoreStack(Stack):
             ),
         )
 
-        # Bedrock InvokeModel — scoped to specific models
-        self.agent_role.add_to_policy(
+        # Bedrock model invocation
+        self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
                     "bedrock:InvokeModel",
                     "bedrock:InvokeModelWithResponseStream",
+                    "bedrock:Converse",
+                    "bedrock:ConverseStream",
                 ],
                 resources=[
-                    f"arn:aws:bedrock:{region}::foundation-model/*",
-                    f"arn:aws:bedrock:us-east-1::foundation-model/*",
+                    "arn:aws:bedrock:*::foundation-model/*",
+                    f"arn:aws:bedrock:{region}:{account}:inference-profile/*",
+                ],
+            )
+        )
+
+        # Secrets Manager (gateway token, channel tokens, Cognito secret)
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "secretsmanager:GetSecretValue",
+                    "secretsmanager:DescribeSecret",
+                ],
+                resources=[
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
+                ],
+            )
+        )
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["kms:Decrypt"],
+                resources=[cmk_arn],
+            )
+        )
+
+        # Cognito admin operations for auto-provisioning identities
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "cognito-idp:AdminCreateUser",
+                    "cognito-idp:AdminSetUserPassword",
+                    "cognito-idp:AdminInitiateAuth",
+                    "cognito-idp:AdminGetUser",
+                ],
+                resources=[
+                    f"arn:aws:cognito-idp:{region}:{account}:userpool/*",
                 ],
             )
         )
 
         # AgentCore Memory APIs
-        self.agent_role.add_to_policy(
+        self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
                     "bedrock:CreateMemory",
@@ -98,19 +143,8 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # AgentCore Runtime invocation
-        self.agent_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "bedrock-agentcore:InvokeRuntime",
-                    "bedrock-agentcore:InvokeRuntimeEndpoint",
-                ],
-                resources=["*"],
-            )
-        )
-
-        # CloudWatch Logs + Metrics
-        self.agent_role.add_to_policy(
+        # CloudWatch Logs + Metrics + X-Ray
+        self.execution_role.add_to_policy(
             iam.PolicyStatement(
                 actions=[
                     "logs:CreateLogGroup",
@@ -125,9 +159,9 @@ class AgentCoreStack(Stack):
         )
 
         # ECR pull
-        self.agent_repo.grant_pull(self.agent_role)
+        self.bridge_repo.grant_pull(self.execution_role)
 
-        # --- Memory Execution Role ----------------------------------------
+        # --- Memory Execution Role --------------------------------------------
         self.memory_role = iam.Role(
             self,
             "MemoryExecutionRole",
@@ -143,12 +177,12 @@ class AgentCoreStack(Stack):
             )
         )
 
-        # --- AgentCore Memory ---------------------------------------------
+        # --- AgentCore Memory -------------------------------------------------
         self.memory = agentcore.CfnMemory(
             self,
             "AgentMemory",
             name="openclaw_memory",
-            event_expiry_duration=90,  # 90 days (matches token_ttl_days)
+            event_expiry_duration=90,
             description="OpenClaw conversation memory",
             encryption_key_arn=cmk_arn,
             memory_execution_role_arn=self.memory_role.role_arn,
@@ -174,21 +208,24 @@ class AgentCoreStack(Stack):
             ],
         )
 
-        # --- AgentCore WorkloadIdentity ------------------------------------
+        # --- AgentCore WorkloadIdentity ---------------------------------------
         self.workload_identity = agentcore.CfnWorkloadIdentity(
             self,
             "WorkloadIdentity",
             name="openclaw_identity",
         )
 
-        # --- AgentCore Runtime --------------------------------------------
+        # --- Default Bedrock model ID -----------------------------------------
+        default_model_id = self.node.try_get_context("default_model_id") or "us.anthropic.claude-sonnet-4-6"
+
+        # --- AgentCore Runtime (hosts OpenClaw container) ---------------------
         self.runtime = agentcore.CfnRuntime(
             self,
             "AgentRuntime",
             agent_runtime_name="openclaw_agent",
             agent_runtime_artifact=agentcore.CfnRuntime.AgentRuntimeArtifactProperty(
                 container_configuration=agentcore.CfnRuntime.ContainerConfigurationProperty(
-                    container_uri=f"{account}.dkr.ecr.{region}.amazonaws.com/openclaw-agent:latest"
+                    container_uri=f"{account}.dkr.ecr.{region}.amazonaws.com/openclaw-bridge:latest"
                 )
             ),
             network_configuration=agentcore.CfnRuntime.NetworkConfigurationProperty(
@@ -198,62 +235,66 @@ class AgentCoreStack(Stack):
                     security_groups=[self.agent_sg.security_group_id],
                 ),
             ),
-            authorizer_configuration=agentcore.CfnRuntime.AuthorizerConfigurationProperty(
-                custom_jwt_authorizer=agentcore.CfnRuntime.CustomJWTAuthorizerConfigurationProperty(
-                    discovery_url=f"{cognito_issuer_url}/.well-known/openid-configuration",
-                    allowed_audience=[cognito_client_id],
-                    allowed_clients=[cognito_client_id],
-                ),
-            ),
-            role_arn=self.agent_role.role_arn,
+            role_arn=self.execution_role.role_arn,
             environment_variables={
-                "DEFAULT_MODEL_ID": "us.anthropic.claude-sonnet-4-6",
                 "AWS_REGION": region,
+                "BEDROCK_MODEL_ID": default_model_id,
+                "GATEWAY_TOKEN_SECRET_ID": gateway_token_secret_name,
+                "COGNITO_USER_POOL_ID": cognito_user_pool_id,
+                "COGNITO_CLIENT_ID": cognito_client_id,
+                "COGNITO_PASSWORD_SECRET_ID": cognito_password_secret_name,
                 "AGENTCORE_MEMORY_ID": self.memory.attr_memory_id,
             },
-            description="OpenClaw personal assistant agent on AgentCore Runtime",
+            description="OpenClaw messaging bridge on AgentCore Runtime",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
-                idle_runtime_session_timeout=1800,
-                max_lifetime=3600,
+                # Max values to keep the container running as long as possible.
+                # HealthyBusy ping status prevents idle termination.
+                idle_runtime_session_timeout=28800,  # 8 hours
+                max_lifetime=28800,  # 8 hours
             ),
         )
 
-        # --- AgentCore Runtime Endpoint -----------------------------------
+        # --- AgentCore Runtime Endpoint ---------------------------------------
         self.runtime_endpoint = agentcore.CfnRuntimeEndpoint(
             self,
             "AgentRuntimeEndpoint",
             agent_runtime_id=self.runtime.attr_agent_runtime_id,
             name="openclaw_agent_live",
-            description="Production endpoint for OpenClaw agent",
+            description="Production endpoint for OpenClaw on AgentCore",
         )
-        # Explicit dependency: Runtime must reach READY before Endpoint creation
         self.runtime_endpoint.add_dependency(self.runtime)
 
-        # --- Expose outputs for downstream stacks -------------------------
+        # --- Outputs ----------------------------------------------------------
         self.runtime_id = self.runtime.attr_agent_runtime_id
+        self.runtime_arn = f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{self.runtime.attr_agent_runtime_id}"
         self.runtime_endpoint_id = self.runtime_endpoint.attr_id
-        self.runtime_endpoint_arn = self.runtime_endpoint.attr_agent_runtime_endpoint_arn
         self.memory_id = self.memory.attr_memory_id
-        self.workload_identity_arn = self.workload_identity.attr_workload_identity_arn
 
         CfnOutput(self, "RuntimeId", value=self.runtime.attr_agent_runtime_id)
         CfnOutput(self, "RuntimeEndpointId", value=self.runtime_endpoint.attr_id)
         CfnOutput(self, "MemoryId", value=self.memory.attr_memory_id)
         CfnOutput(self, "WorkloadIdentityArn", value=self.workload_identity.attr_workload_identity_arn)
+        CfnOutput(
+            self,
+            "RuntimeArn",
+            value=f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/{self.runtime.attr_agent_runtime_id}",
+        )
 
-        # --- cdk-nag suppressions ---
+        # --- cdk-nag suppressions ---------------------------------------------
         cdk_nag.NagSuppressions.add_resource_suppressions(
-            self.agent_role,
+            self.execution_role,
             [
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-IAM5",
-                    reason="Bedrock foundation model ARNs require wildcard for model ID "
-                    "because the agent may use multiple models. Actions are scoped to "
-                    "InvokeModel only. Memory, AgentCore Runtime, Logs, Metrics, and "
-                    "X-Ray APIs do not support resource-level permissions.",
+                    reason="Bedrock foundation model ARNs require wildcard for model ID. "
+                    "Memory, Logs, Metrics, X-Ray, and Secrets Manager APIs are scoped "
+                    "to project prefix (openclaw/*) or do not support resource-level "
+                    "permissions. Cognito userpool/* is scoped to this account/region.",
                     applies_to=[
-                        f"Resource::arn:aws:bedrock:{region}::foundation-model/*",
-                        "Resource::arn:aws:bedrock:us-east-1::foundation-model/*",
+                        "Resource::arn:aws:bedrock:*::foundation-model/*",
+                        f"Resource::arn:aws:bedrock:{region}:{account}:inference-profile/*",
+                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
+                        f"Resource::arn:aws:cognito-idp:{region}:{account}:userpool/*",
                         "Resource::*",
                     ],
                 ),

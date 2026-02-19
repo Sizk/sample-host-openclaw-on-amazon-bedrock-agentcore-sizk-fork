@@ -1,4 +1,5 @@
-FROM node:22-slim
+# AgentCore Runtime requires ARM64
+FROM --platform=linux/arm64 node:22-slim
 
 # Install system dependencies
 RUN apt-get update && \
@@ -16,13 +17,13 @@ RUN mkdir -p /app /root/.openclaw
 
 WORKDIR /app
 
-# Install AWS SDK for Bedrock Runtime, AgentCore, and Cognito (used by the proxy adapter)
+# Install AWS SDK for Bedrock Runtime and Cognito (used by the proxy adapter)
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install @aws-sdk/client-bedrock-runtime \
-                @aws-sdk/client-bedrock-agentcore \
                 @aws-sdk/client-cognito-identity-provider
 
-# Copy the Bedrock proxy adapter and IPv4 DNS patch
+# Copy application files
+COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY force-ipv4.js /app/force-ipv4.js
 
@@ -30,9 +31,10 @@ COPY force-ipv4.js /app/force-ipv4.js
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-EXPOSE 18789 18790
+# AgentCore Runtime requires port 8080
+EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=60s \
-    CMD curl -f http://localhost:18790/health || exit 1
+# AgentCore Runtime uses /ping for health checks (not Docker HEALTHCHECK)
+# No HEALTHCHECK directive needed — AgentCore manages this via /ping endpoint
 
 ENTRYPOINT ["/app/entrypoint.sh"]

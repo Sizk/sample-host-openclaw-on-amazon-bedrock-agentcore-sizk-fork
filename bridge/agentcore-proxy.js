@@ -2,24 +2,17 @@
  * Bedrock Proxy Adapter
  *
  * Translates OpenAI-compatible chat completion requests from OpenClaw
- * into either direct Bedrock Converse API calls or AgentCore Runtime
- * invocations, depending on the PROXY_MODE environment variable.
- *
- * Modes:
- *   - "bedrock-direct" (default): Uses Bedrock ConverseStream API directly
- *   - "agentcore": Routes through AgentCore Runtime endpoint
+ * into Bedrock Converse API calls. Runs inside the OpenClaw container
+ * hosted on AgentCore Runtime.
  */
 
 const http = require("http");
 const crypto = require("crypto");
 
 const PORT = 18790;
-const AWS_REGION = process.env.AWS_REGION || "ap-southeast-2";
+const AWS_REGION = process.env.AWS_REGION || "us-west-2";
 const MODEL_ID =
-  process.env.BEDROCK_MODEL_ID || "au.anthropic.claude-sonnet-4-6";
-const PROXY_MODE = process.env.PROXY_MODE || "bedrock-direct";
-const AGENTCORE_RUNTIME_ARN = process.env.AGENTCORE_RUNTIME_ARN || "";
-const AGENTCORE_RUNTIME_ENDPOINT_ID = process.env.AGENTCORE_RUNTIME_ENDPOINT_ID || "";
+  process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-sonnet-4-6";
 
 // Cognito identity configuration
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
@@ -347,266 +340,6 @@ async function invokeBedrockStreaming(messages, res, model) {
 }
 
 /**
- * Invoke AgentCore Runtime endpoint (non-streaming).
- * Uses the bedrock-agentcore SDK (InvokeAgentRuntime API).
- */
-async function invokeAgentCore(messages, sessionId, actorId, channel) {
-  const { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } = require(
-    "@aws-sdk/client-bedrock-agentcore"
-  );
-  const client = new BedrockAgentCoreClient({ region: AWS_REGION });
-
-  // Extract the last user message as the prompt
-  const lastUserMsg = messages.filter((m) => m.role === "user").pop();
-  const prompt = lastUserMsg
-    ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
-    : "";
-
-  // Payload matches what my_agent.py handle_request() expects
-  const payloadJson = JSON.stringify({
-    prompt,
-    actor_id: actorId,
-    session_id: sessionId,
-    channel,
-  });
-
-  let lastError;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 0) {
-        const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
-        console.log(`[proxy] AgentCore retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms`);
-        await sleep(delay);
-      }
-
-      const command = new InvokeAgentRuntimeCommand({
-        agentRuntimeArn: AGENTCORE_RUNTIME_ARN,
-        qualifier: AGENTCORE_RUNTIME_ENDPOINT_ID || undefined,
-        runtimeSessionId: sessionId,
-        payload: Buffer.from(payloadJson),
-        contentType: "application/json",
-        accept: "application/json",
-      });
-
-      const response = await client.send(command);
-
-      // Collect full response from streaming body
-      let fullBody = "";
-      if (response.response) {
-        if (typeof response.response[Symbol.asyncIterator] === "function") {
-          for await (const chunk of response.response) {
-            fullBody += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
-          }
-        } else if (response.response instanceof Buffer || response.response instanceof Uint8Array) {
-          fullBody = new TextDecoder().decode(response.response);
-        } else if (typeof response.response === "string") {
-          fullBody = response.response;
-        } else {
-          // Try reading as a readable stream
-          const chunks = [];
-          for await (const chunk of response.response) {
-            chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-          }
-          fullBody = Buffer.concat(chunks).toString("utf-8");
-        }
-      }
-
-      // Parse the agent's JSON response (my_agent.py returns {"response": "...", ...})
-      let responseText = fullBody;
-      try {
-        const parsed = JSON.parse(fullBody);
-        if (parsed.response) {
-          responseText = parsed.response;
-        } else if (parsed.error) {
-          throw new Error(`Agent error: ${parsed.error}`);
-        }
-      } catch (parseErr) {
-        // If not JSON, use the raw text
-        if (parseErr.message.startsWith("Agent error:")) throw parseErr;
-        console.log(`[proxy] AgentCore response is not JSON, using raw text (${fullBody.length} chars)`);
-      }
-
-      return {
-        text: responseText || "I received your message but have no response.",
-        usage: {},
-      };
-    } catch (err) {
-      lastError = err;
-      console.error(`[proxy] AgentCore invocation attempt ${attempt + 1} failed:`, err.message);
-      if (err.$metadata && err.$metadata.httpStatusCode < 500) break;
-    }
-  }
-  throw lastError || new Error("AgentCore invocation failed after retries");
-}
-
-/**
- * Invoke AgentCore Runtime endpoint with SSE streaming to the HTTP response.
- * Uses the bedrock-agentcore SDK (InvokeAgentRuntime API).
- *
- * AgentCore returns the full response (agent handler is synchronous), so we
- * collect it and then emit it as OpenAI-compatible SSE chunks to simulate streaming.
- * If AgentCore returns text/event-stream, we forward the SSE data lines directly.
- */
-async function invokeAgentCoreStreaming(messages, res, model, sessionId, actorId, channel) {
-  const { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } = require(
-    "@aws-sdk/client-bedrock-agentcore"
-  );
-  const client = new BedrockAgentCoreClient({ region: AWS_REGION });
-
-  const lastUserMsg = messages.filter((m) => m.role === "user").pop();
-  const prompt = lastUserMsg
-    ? (typeof lastUserMsg.content === "string" ? lastUserMsg.content : JSON.stringify(lastUserMsg.content))
-    : "";
-
-  const payloadJson = JSON.stringify({
-    prompt,
-    actor_id: actorId,
-    session_id: sessionId,
-    channel,
-  });
-
-  const chatId = `chatcmpl-${Date.now()}`;
-  const created = Math.floor(Date.now() / 1000);
-
-  let lastError;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    try {
-      if (attempt > 0) {
-        const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
-        console.log(`[proxy] AgentCore stream retry ${attempt + 1}/${MAX_RETRIES} after ${delay}ms`);
-        await sleep(delay);
-      }
-
-      const command = new InvokeAgentRuntimeCommand({
-        agentRuntimeArn: AGENTCORE_RUNTIME_ARN,
-        qualifier: AGENTCORE_RUNTIME_ENDPOINT_ID || undefined,
-        runtimeSessionId: sessionId,
-        payload: Buffer.from(payloadJson),
-        contentType: "application/json",
-        accept: "application/json",
-      });
-
-      const response = await client.send(command);
-
-      // Write SSE headers
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        "Connection": "keep-alive",
-      });
-
-      const contentType = response.contentType || "";
-
-      if (contentType.includes("text/event-stream") && response.response) {
-        // Forward SSE stream directly — parse data lines and emit as OpenAI chunks
-        let buffer = "";
-        for await (const rawChunk of response.response) {
-          const text = typeof rawChunk === "string" ? rawChunk : new TextDecoder().decode(rawChunk);
-          buffer += text;
-          // Process complete lines
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              const data = line.slice(6);
-              const chunk = {
-                id: chatId,
-                object: "chat.completion.chunk",
-                created,
-                model: model || MODEL_ID,
-                choices: [{
-                  index: 0,
-                  delta: { content: data },
-                  finish_reason: null,
-                }],
-              };
-              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-            }
-          }
-        }
-      } else {
-        // Collect full response and emit as simulated streaming chunks
-        let fullBody = "";
-        if (response.response) {
-          if (typeof response.response[Symbol.asyncIterator] === "function") {
-            for await (const chunk of response.response) {
-              fullBody += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
-            }
-          } else if (response.response instanceof Buffer || response.response instanceof Uint8Array) {
-            fullBody = new TextDecoder().decode(response.response);
-          } else if (typeof response.response === "string") {
-            fullBody = response.response;
-          } else {
-            const chunks = [];
-            for await (const chunk of response.response) {
-              chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
-            }
-            fullBody = Buffer.concat(chunks).toString("utf-8");
-          }
-        }
-
-        // Parse the agent response
-        let responseText = fullBody;
-        try {
-          const parsed = JSON.parse(fullBody);
-          if (parsed.response) responseText = parsed.response;
-          else if (parsed.error) responseText = `Error: ${parsed.error}`;
-        } catch (_) {
-          // Not JSON — use raw text
-        }
-
-        // Emit the full text as a single SSE chunk (OpenClaw handles display)
-        const chunk = {
-          id: chatId,
-          object: "chat.completion.chunk",
-          created,
-          model: model || MODEL_ID,
-          choices: [{
-            index: 0,
-            delta: { content: responseText },
-            finish_reason: null,
-          }],
-        };
-        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      }
-
-      // Final chunk + [DONE]
-      const finalChunk = {
-        id: chatId,
-        object: "chat.completion.chunk",
-        created,
-        model: model || MODEL_ID,
-        choices: [{
-          index: 0,
-          delta: {},
-          finish_reason: "stop",
-        }],
-      };
-      res.write(`data: ${JSON.stringify(finalChunk)}\n\n`);
-      res.write("data: [DONE]\n\n");
-      res.end();
-
-      console.log(`[proxy] AgentCore stream complete`);
-      return;
-    } catch (err) {
-      lastError = err;
-      console.error(`[proxy] AgentCore stream attempt ${attempt + 1} failed:`, err.message);
-      if (err.$metadata && err.$metadata.httpStatusCode < 500) break;
-    }
-  }
-
-  // If all retries failed and headers not yet sent
-  if (!res.headersSent) {
-    res.writeHead(502, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      error: { message: "AgentCore streaming failed: " + lastError.message, type: "proxy_error" },
-    }));
-  } else {
-    res.end();
-  }
-}
-
-/**
  * Format a response as an OpenAI-compatible chat completion response.
  */
 function formatChatResponse(result, model) {
@@ -643,7 +376,6 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       status: "ok",
       model: MODEL_ID,
-      mode: PROXY_MODE,
       cognito: COGNITO_USER_POOL_ID ? "configured" : "disabled",
     }));
     return;
@@ -660,7 +392,7 @@ const server = http.createServer(async (req, res) => {
         const stream = parsed.stream === true;
 
         console.log(
-          `[proxy] Incoming request: ${messages.length} messages, model=${parsed.model || MODEL_ID}, stream=${stream}, mode=${PROXY_MODE}`
+          `[proxy] Incoming request: ${messages.length} messages, model=${parsed.model || MODEL_ID}, stream=${stream}`
         );
 
         // Extract identity for all modes (used for logging + Cognito)
@@ -674,31 +406,17 @@ const server = http.createServer(async (req, res) => {
           console.warn(`[proxy] Cognito token acquisition failed for ${actorId}:`, err.message);
         }
 
-        if (PROXY_MODE === "agentcore" && AGENTCORE_RUNTIME_ARN) {
-          // --- AgentCore path ---
-          console.log(`[proxy] AgentCore: session=${sessionId} actor=${actorId} channel=${channel} jwt=${cognitoToken ? "yes" : "no"}`);
-
-          if (stream) {
-            await invokeAgentCoreStreaming(messages, res, parsed.model, sessionId, actorId, channel);
-          } else {
-            const result = await invokeAgentCore(messages, sessionId, actorId, channel);
-            const response = formatChatResponse(result, parsed.model);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(response));
-          }
+        // --- Direct Bedrock path ---
+        if (stream) {
+          await invokeBedrockStreaming(messages, res, parsed.model);
         } else {
-          // --- Direct Bedrock path (default) ---
-          if (stream) {
-            await invokeBedrockStreaming(messages, res, parsed.model);
-          } else {
-            const result = await invokeBedrock(messages);
-            const response = formatChatResponse(result, parsed.model);
-            console.log(
-              `[proxy] Response: ${result.usage.inputTokens || "?"}in/${result.usage.outputTokens || "?"}out tokens`
-            );
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(response));
-          }
+          const result = await invokeBedrock(messages);
+          const response = formatChatResponse(result, parsed.model);
+          console.log(
+            `[proxy] Response: ${result.usage.inputTokens || "?"}in/${result.usage.outputTokens || "?"}out tokens`
+          );
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(response));
         }
       } catch (err) {
         console.error("[proxy] Request failed:", err.message);
@@ -742,12 +460,8 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(
-    `[proxy] Bedrock proxy adapter listening on http://0.0.0.0:${PORT} (model: ${MODEL_ID}, mode: ${PROXY_MODE})`
+    `[proxy] Bedrock proxy adapter listening on http://0.0.0.0:${PORT} (model: ${MODEL_ID})`
   );
-  if (PROXY_MODE === "agentcore") {
-    console.log(`[proxy] AgentCore ARN: ${AGENTCORE_RUNTIME_ARN || "(not set)"}`);
-    console.log(`[proxy] AgentCore qualifier: ${AGENTCORE_RUNTIME_ENDPOINT_ID || "(none)"}`);
-  }
   console.log(
     `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`
   );
