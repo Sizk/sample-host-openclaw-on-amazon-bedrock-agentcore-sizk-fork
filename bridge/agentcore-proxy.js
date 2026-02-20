@@ -49,33 +49,71 @@ function sleep(ms) {
 }
 
 /**
- * Parse an OpenClaw session key to extract channel and actor identity.
+ * Parse actorId and channel from OpenClaw's message envelope.
  *
- * Session key formats:
- *   agent:{agentId}:{channel}:{peerId}                    (DM)
- *   agent:{agentId}:{channel}:group:{groupId}             (group chat)
- *   agent:{agentId}:{channel}:channel:{channelId}         (channel chat)
- *   agent:{agentId}:{channel}:group:{groupId}:topic:{id}  (forum topic)
- *   main                                                   (default/fallback)
+ * OpenClaw wraps every inbound message in an envelope like:
+ *   DMs:    "[Telegram DM from telegram:6087229962]\nHello"
+ *   Groups: "[Telegram Group from telegram:group:-100123]\nAlice (id:6087229962): Hello"
+ *
+ * For DMs the `from` field IS the per-user identity.
+ * For groups the `from` field is the group/channel ID; the individual sender
+ * appears as "(id:<user_id>)" in the message body — we extract the last one
+ * (most recent speaker) and combine it with the channel prefix.
+ *
+ * Returns { actorId, channel } or null if no envelope found.
  */
-function parseSessionKey(sessionKey) {
-  let channel = "unknown";
-  let actorId = "";
+function parseEnvelopeIdentity(messages) {
+  // Find the last user-role message (most recent inbound)
+  const userMessages = (messages || []).filter((m) => m.role === "user");
+  if (userMessages.length === 0) return null;
 
-  // "agent:{agentId}:{channel}:{rest}" — standard format
-  const agentMatch = sessionKey.match(/^agent:[^:]+:([^:]+):(.+)$/);
-  if (agentMatch) {
-    channel = agentMatch[1];
-    actorId = `${channel}:${agentMatch[2]}`;
-    return { channel, actorId };
+  const lastMsg = userMessages[userMessages.length - 1];
+  const text = typeof lastMsg.content === "string"
+    ? lastMsg.content
+    : JSON.stringify(lastMsg.content);
+
+  // Match the envelope header: [Channel Type from channel:id]
+  const envelopeRe = /\[(\w+)\s+\w+\s+from\s+((?:telegram|discord|slack):\S+)\]/i;
+  const envMatch = text.match(envelopeRe);
+  if (!envMatch) return null;
+
+  const channelName = envMatch[1].toLowerCase(); // "telegram", "discord", "slack"
+  const fromId = envMatch[2];                     // e.g. "telegram:6087229962" or "telegram:group:-100123"
+
+  // Check if this is a group/channel context (contains "group:" or "channel:" in the from ID)
+  const isGroup = /:(group|channel):/.test(fromId);
+
+  if (!isGroup) {
+    // DM — the from field is the per-user identity
+    return { actorId: fromId, channel: channelName };
   }
 
-  return { channel, actorId };
+  // Group/channel — extract the individual sender from "(id:XXXXX)" in the body
+  // The envelope body follows the header line. Find all sender ID patterns and use the last one.
+  const senderIdRe = /\(id:(\S+?)\)/g;
+  let lastSenderId = null;
+  let match;
+  while ((match = senderIdRe.exec(text)) !== null) {
+    lastSenderId = match[1];
+  }
+
+  if (lastSenderId) {
+    return { actorId: `${channelName}:${lastSenderId}`, channel: channelName };
+  }
+
+  // Group message but no individual sender ID found — fall back to group identity
+  return { actorId: fromId, channel: channelName };
 }
 
 /**
  * Extract session metadata from request headers and body.
  * Returns { sessionId, actorId, channel }.
+ *
+ * Identity resolution priority:
+ *   1. x-openclaw-actor-id header (explicit, custom)
+ *   2. OpenAI 'user' field in request body
+ *   3. Parse from OpenClaw message envelope text
+ *   4. Fallback to "default-user"
  */
 function extractSessionMetadata(parsed, headers) {
   let actorId = "";
@@ -108,47 +146,7 @@ function extractSessionMetadata(parsed, headers) {
   sessionId = headers["x-openclaw-session-id"] || "";
   if (actorId) idSource = "header";
 
-  // 2. Parse OpenClaw system prompt for identity signals
-  if (!actorId && parsed.messages) {
-    const systemMsg = parsed.messages.find(m => m.role === "system");
-    if (systemMsg) {
-      const content = typeof systemMsg.content === "string"
-        ? systemMsg.content : "";
-
-      // 2a. Extract chat_id from system prompt JSON examples (e.g. "chat_id": "telegram:6087229962")
-      const chatIdMatch = content.match(/"chat_id":\s*"((?:telegram|discord|slack|whatsapp|web|signal|imessage):([^"]+))"/i);
-      if (chatIdMatch) {
-        actorId = chatIdMatch[1];
-        channel = chatIdMatch[1].split(":")[0].toLowerCase();
-      }
-
-      // 2b. Fallback: parse Session: line (e.g. "Session: agent:main:telegram:123456789 •")
-      if (!actorId) {
-        const sessionMatch = content.match(/Session:\s+(\S+)/);
-        if (sessionMatch) {
-          const sk = parseSessionKey(sessionMatch[1]);
-          if (sk.actorId) actorId = sk.actorId;
-          if (sk.channel !== "unknown") channel = sk.channel;
-        }
-      }
-
-      // 2c. Fallback: extract channel from "channel": "telegram" in system prompt
-      if (channel === "unknown") {
-        const channelMatch = content.match(/"channel":\s*"(telegram|discord|slack|whatsapp|web|signal|imessage)"/i);
-        if (channelMatch) channel = channelMatch[1].toLowerCase();
-      }
-
-      // 2d. Fallback: extract channel from Runtime line
-      if (channel === "unknown") {
-        const rtMatch = content.match(
-          /Runtime:.*·\s+(telegram|discord|slack|whatsapp|web|signal|imessage)\b/i
-        );
-        if (rtMatch) channel = rtMatch[1].toLowerCase();
-      }
-    }
-  }
-
-  // 3. Check OpenAI 'user' field
+  // 2. Check OpenAI 'user' field (OpenClaw may populate this)
   if (!actorId && parsed.user) {
     actorId = parsed.user;
     idSource = "openai-user-field";
@@ -911,7 +909,7 @@ function convertTools(openaiTools) {
  * Convert OpenAI messages to Bedrock Converse format.
  * Handles user, assistant (with tool_calls), and tool (tool results) roles.
  */
-function convertMessages(messages) {
+function convertMessages(messages, memoryContext) {
   const bedrockMessages = [];
   for (const msg of messages) {
     if (msg.role === "system") continue;
@@ -1018,6 +1016,16 @@ function convertMessages(messages) {
     systemMessages.length > 0
       ? systemMessages.map((m) => m.content).join("\n")
       : SYSTEM_PROMPT;
+
+  const now = new Date();
+  const today = now.toISOString().split("T")[0];
+  const dayOfWeek = now.toLocaleDateString("en-US", { weekday: "long" });
+  const dateContext = `[IMPORTANT: Today is ${dayOfWeek}, ${today}. The current year is ${now.getFullYear()}. Do NOT use your training data cutoff as the current date.]`;
+
+  let systemText = `${dateContext}\n\n${baseSystemText}`;
+  if (memoryContext) {
+    systemText += `\n\n## Relevant Context\n${memoryContext}`;
+  }
 
   return { bedrockMessages, systemText };
 }
@@ -1555,5 +1563,8 @@ server.listen(PORT, "0.0.0.0", () => {
   );
   console.log(
     `[proxy] Cognito identity: ${COGNITO_USER_POOL_ID ? `pool=${COGNITO_USER_POOL_ID} client=${COGNITO_CLIENT_ID}` : "disabled"}`,
+  );
+  console.log(
+    `[proxy] AgentCore Memory: ${AGENTCORE_MEMORY_ID ? `id=${AGENTCORE_MEMORY_ID}` : "disabled"}`
   );
 });

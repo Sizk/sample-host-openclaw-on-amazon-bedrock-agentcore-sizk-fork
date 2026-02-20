@@ -60,6 +60,20 @@ class AgentCoreStack(Stack):
             image_scan_on_push=True,
         )
 
+        # --- S3 Bucket for workspace persistence -------------------------------
+        self.workspace_bucket = s3.Bucket(
+            self,
+            "WorkspaceBucket",
+            bucket_name=f"openclaw-workspace-{account}-{region}",
+            encryption=s3.BucketEncryption.KMS,
+            encryption_key=kms.Key.from_key_arn(self, "ImportedCmk", cmk_arn),
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            enforce_ssl=True,
+            versioned=True,
+            removal_policy=RemovalPolicy.RETAIN,
+            auto_delete_objects=False,
+        )
+
         # --- Security Group for AgentCore Runtime containers ------------------
         self.agent_sg = ec2.SecurityGroup(
             self,
@@ -78,7 +92,6 @@ class AgentCoreStack(Stack):
         self.execution_role = iam.Role(
             self,
             "OpenClawExecutionRole",
-            role_name="openclaw-agentcore-execution-role",
             assumed_by=iam.CompositePrincipal(
                 iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
                 iam.ServicePrincipal("bedrock.amazonaws.com"),
@@ -120,6 +133,9 @@ class AgentCoreStack(Stack):
                 resources=[cmk_arn],
             )
         )
+
+        # S3 workspace persistence
+        self.workspace_bucket.grant_read_write(self.execution_role)
 
         # Cognito admin operations for auto-provisioning identities
         # Scoped to specific user pool
@@ -310,6 +326,16 @@ class AgentCoreStack(Stack):
                     id="AwsSolutions-S1",
                     reason="Server access logging not required for user file storage — "
                     "CloudTrail S3 data events provide sufficient audit trail.",
+                ),
+            ],
+        )
+        cdk_nag.NagSuppressions.add_resource_suppressions(
+            self.workspace_bucket,
+            [
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-S1",
+                    reason="Workspace bucket stores agent workspace files (markdown). "
+                    "Access logging not required for non-sensitive operational data.",
                 ),
             ],
         )
