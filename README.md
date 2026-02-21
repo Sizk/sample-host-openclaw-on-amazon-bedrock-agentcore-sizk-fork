@@ -109,7 +109,7 @@ Or edit `cdk.json` directly:
 {
   "context": {
     "account": "123456789012",
-    "region": "us-west-2"
+    "region": "ap-southeast-2"
   }
 }
 ```
@@ -531,6 +531,23 @@ The Router Lambda validates all incoming webhook requests:
 - **API Gateway**: Only explicit routes are exposed (`POST /webhook/telegram`, `POST /webhook/slack`, `GET /health`). All other paths return 404 from API Gateway without invoking the Lambda. Rate limiting is applied (burst: 50, sustained: 100 req/s).
 
 Requests that fail validation receive a 401 response and are logged with the source IP.
+
+### Per-User Memory
+
+Each user gets isolated, persistent conversation memory powered by AgentCore Memory. The proxy handles all memory operations transparently — OpenClaw is unaware of the memory layer.
+
+**How it works:**
+
+1. **Identity extraction** — The proxy extracts `actorId` from each request (e.g., `telegram:6087229962`, `slack:U0123ABC`). Users are namespaced by replacing colons with underscores (e.g., `telegram_6087229962`).
+2. **Memory retrieval** — Before each Bedrock call, the proxy queries `RetrieveMemoryRecords` with the user's latest message as a semantic search query. Up to 5 relevant memory records are appended to the system prompt.
+3. **Event storage** — After each response, the user/assistant exchange is stored as a memory event via `CreateEvent` (fire-and-forget, non-blocking).
+4. **Memory extraction** — Every 10 minutes, the proxy triggers `StartMemoryExtractionJob` to process accumulated events through 3 configured strategies:
+   - **Semantic** — extracts factual information and topics
+   - **User preference** — captures user preferences and patterns
+   - **Summary** — produces conversation summaries
+5. **Persistence** — Memories survive container restarts because they are stored server-side in AgentCore Memory, not in the container's process memory.
+
+**Graceful degradation** — All memory operations log warnings on failure but never block the chat flow. If `AGENTCORE_MEMORY_ID` is not set, memory is completely disabled.
 
 ### Token Usage Tracking
 
