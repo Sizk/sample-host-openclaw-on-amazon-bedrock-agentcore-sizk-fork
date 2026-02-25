@@ -475,3 +475,4 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Per-user sessions**: Contract server sets `USER_ID` env var when starting proxy, so identity is always resolved from environment in per-user mode
 - **S3-backed isolation**: User files in `s3://openclaw-user-files-{account}-{region}/{namespace}/`
 - **Namespace immutability**: System-determined from channel identity, cannot be changed by user request
+- **actorId vs namespace**: actorId uses colon format (`telegram:6087229962`), namespace uses underscore format (`telegram_6087229962`). Skill scripts (s3-user-files, eventbridge-cron) expect namespace format. The lightweight agent's `chat()` converts via `userId.replace(/:/g, "_")` before passing to tools. The proxy and workspace sync also use namespace format for S3 keys
