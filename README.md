@@ -272,7 +272,8 @@ openclaw-on-agentcore/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     router/index.py               # Webhook router (Telegram + Slack)
   scripts/
-    setup-telegram.sh             # Webhook registration + admin allowlist (one-step)
+    setup-telegram.sh             # Telegram webhook + admin allowlist (one-step)
+    setup-slack.sh                # Slack Event Subscriptions + admin allowlist
     manage-allowlist.sh           # Add/remove/list users in the allowlist
   docs/
     architecture.md               # Detailed architecture diagram
@@ -384,6 +385,18 @@ OpenClaw uses **Slack Events API** with the Router Lambda as the webhook endpoin
     ```
 
 The signing secret is used by the Router Lambda to validate `X-Slack-Signature` HMAC on every incoming webhook request (with 5-minute replay attack prevention).
+
+**Add yourself to the allowlist:**
+
+17. Find your Slack member ID: click your profile picture → **Profile** → **⋯** (more) → **Copy member ID**
+18. Run the setup script (handles steps 9–11 and the allowlist in one go):
+    ```bash
+    ./scripts/setup-slack.sh
+    ```
+    Or add yourself manually:
+    ```bash
+    ./scripts/manage-allowlist.sh add slack:YOUR_MEMBER_ID
+    ```
 
 ## How It Works
 

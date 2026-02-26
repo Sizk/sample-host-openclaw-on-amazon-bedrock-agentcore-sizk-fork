@@ -102,7 +102,8 @@ openclaw-on-agentcore/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     router/index.py               # Webhook router (Telegram + Slack)
   scripts/
-    setup-telegram.sh             # Webhook registration + admin allowlist (one-step)
+    setup-telegram.sh             # Telegram webhook + admin allowlist (one-step)
+    setup-slack.sh                # Slack Event Subscriptions + admin allowlist
     manage-allowlist.sh           # Add/remove/list users in the allowlist
   docs/
     architecture.md               # Detailed architecture diagrams
@@ -190,6 +191,12 @@ aws secretsmanager update-secret \
   --secret-string '{"botToken":"xoxb-YOUR-BOT-TOKEN","signingSecret":"YOUR-SIGNING-SECRET"}' \
   --region $CDK_DEFAULT_REGION
 ```
+
+### Slack Setup (Event Subscriptions + Allowlist)
+```bash
+./scripts/setup-slack.sh
+```
+This displays the webhook URL for Slack Event Subscriptions, prompts for your Slack member ID, and adds you to the allowlist.
 
 ### Deploy New Bridge Version
 ```bash
