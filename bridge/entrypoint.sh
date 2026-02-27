@@ -7,6 +7,14 @@ echo "[openclaw-agentcore] Starting OpenClaw on AgentCore Runtime (per-user sess
 echo "[openclaw-agentcore] Node: $(node --version 2>&1 || echo 'not found')"
 echo "[openclaw-agentcore] AWS_REGION=${AWS_REGION:-not set}"
 
+# --- V8 Compile Cache (Node.js 22+) ---
+# Caches compiled bytecode so modules load faster on subsequent runs.
+# Pre-warmed at Docker build time with AWS SDK modules.
+if [ -d /app/.compile-cache ]; then
+    export NODE_COMPILE_CACHE=/app/.compile-cache
+    echo "[openclaw-agentcore] V8 compile cache enabled: /app/.compile-cache"
+fi
+
 # --- Force IPv4 for Node.js 22 VPC compatibility ---
 export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--dns-result-order=ipv4first --no-network-family-autoselection -r /app/force-ipv4.js"
 

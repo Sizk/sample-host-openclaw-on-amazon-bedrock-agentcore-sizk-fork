@@ -11,6 +11,7 @@
  */
 
 const http = require("http");
+const https = require("https");
 const { execFile, spawn } = require("child_process");
 
 const PROXY_PORT = 18790;
@@ -19,17 +20,26 @@ const PROXY_URL = `http://127.0.0.1:${PROXY_PORT}/v1/chat/completions`;
 const MAX_ITERATIONS = 20;
 const TOOL_TIMEOUT_MS = 30000;
 const HTTP_TIMEOUT_MS = 120000;
+const WEB_FETCH_TIMEOUT_MS = 15000;
+const WEB_FETCH_MAX_BYTES = 512 * 1024; // 512KB raw HTML limit
+const WEB_FETCH_MAX_TEXT = 50000; // 50KB text output limit
+const WEB_SEARCH_MAX_RESULTS = 8;
 
 const SYSTEM_PROMPT =
   "You are a helpful personal assistant. You are friendly, concise, and knowledgeable. " +
   "You help users with a wide range of tasks. Keep responses concise unless the user asks " +
   "for detail. If you don't know something, say so honestly. You are accessed through " +
-  "messaging channels (Telegram, Slack). Keep responses appropriate for chat-style messaging. " +
-  "You can also schedule recurring tasks using EventBridge cron. When users ask for reminders, " +
-  "scheduled tasks, or recurring actions, use the scheduling tools. Always ask for timezone if not known. " +
-  "After startup completes (~2-4 minutes), you gain additional capabilities: web search, " +
-  "web page reading, deep research, YouTube transcripts, Hacker News, news feeds, and more. " +
-  "During this initial warm-up period, you can help with file storage, scheduling, and general knowledge.";
+  "messaging channels (Telegram, Slack). Keep responses appropriate for chat-style messaging.\n\n" +
+  "Your capabilities:\n" +
+  "- **Web search**: Search the web for current information using web_search\n" +
+  "- **Web fetch**: Read any web page content using web_fetch\n" +
+  "- **File storage**: Read, write, list, and delete files in user's persistent S3 storage\n" +
+  "- **Scheduling**: Create, list, update, and delete recurring cron schedules via EventBridge\n\n" +
+  "When users ask for reminders, scheduled tasks, or recurring actions, use the scheduling tools. " +
+  "Always ask for timezone if not known.\n\n" +
+  "After full startup completes (~2-4 minutes), you gain additional capabilities: " +
+  "deep research (multi-step analysis), YouTube transcripts, Hacker News browsing, " +
+  "news feeds, task decomposition with sub-agents, and more community skills.";
 
 const TOOLS = [
   {
@@ -208,6 +218,45 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "web_fetch",
+      description:
+        "Fetch a web page and return its content as plain text. " +
+        "Use this to read articles, documentation, or any web page content.",
+      parameters: {
+        type: "object",
+        properties: {
+          url: {
+            type: "string",
+            description:
+              "The full URL to fetch (must start with http:// or https://)",
+          },
+        },
+        required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "web_search",
+      description:
+        "Search the web using DuckDuckGo. Returns titles, URLs, and snippets " +
+        "for the top results. Use this to find current information, news, or answers.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description: "The search query",
+          },
+        },
+        required: ["query"],
+      },
+    },
+  },
 ];
 
 /**
@@ -235,7 +284,342 @@ const SCRIPT_MAP = {
   list_schedules: "/skills/eventbridge-cron/list.js",
   update_schedule: "/skills/eventbridge-cron/update.js",
   delete_schedule: "/skills/eventbridge-cron/delete.js",
+  web_fetch: null, // In-process tool — no child process script
+  web_search: null, // In-process tool — no child process script
 };
+
+// --- SSRF prevention: block private/reserved IPs ---
+
+const BLOCKED_IP_PATTERNS = [
+  /^127\./, // loopback
+  /^10\./, // 10.0.0.0/8
+  /^172\.(1[6-9]|2\d|3[01])\./, // 172.16.0.0/12
+  /^192\.168\./, // 192.168.0.0/16
+  /^169\.254\./, // link-local (AWS IMDS at 169.254.169.254)
+  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, // RFC 6598 shared address space
+  /^0\./, // 0.0.0.0/8
+  /^fc00:/i, // IPv6 unique local
+  /^fe80:/i, // IPv6 link-local
+  /^::1$/, // IPv6 loopback
+  /^fd/i, // IPv6 unique local (covers fd00:ec2::254 AWS IMDSv2)
+  /^fd00:0*ec2:/i, // AWS IMDSv2 IPv6 — normalized/expanded forms
+  // IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) — prevents DNS rebinding via AAAA records
+  /^::ffff:127\./i, // IPv4-mapped loopback
+  /^::ffff:10\./i, // IPv4-mapped 10.0.0.0/8
+  /^::ffff:172\.(1[6-9]|2\d|3[01])\./i, // IPv4-mapped 172.16.0.0/12
+  /^::ffff:192\.168\./i, // IPv4-mapped 192.168.0.0/16
+  /^::ffff:169\.254\./i, // IPv4-mapped link-local (IMDS)
+  /^::ffff:0\./i, // IPv4-mapped 0.0.0.0/8
+];
+
+const BLOCKED_HOSTNAMES = new Set([
+  "localhost",
+  "metadata.google.internal",
+  "metadata.internal",
+  "instance-data", // GCP metadata alias
+]);
+
+/**
+ * Check if a URL target is safe (not a private/reserved address).
+ * Returns null if safe, or an error message string if blocked.
+ */
+function validateUrlSafety(urlStr) {
+  if (!urlStr || typeof urlStr !== "string") {
+    return "URL is required";
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(urlStr);
+  } catch {
+    return "Invalid URL format";
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return `Unsupported protocol: ${parsed.protocol} (only http/https allowed)`;
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+
+  if (BLOCKED_HOSTNAMES.has(hostname)) {
+    return `Blocked hostname: ${hostname}`;
+  }
+
+  for (const pattern of BLOCKED_IP_PATTERNS) {
+    if (pattern.test(hostname)) {
+      return `Blocked IP address: ${hostname}`;
+    }
+  }
+
+  return null; // safe
+}
+
+/**
+ * Strip HTML tags and return plain text.
+ * Removes script/style content, decodes common entities, collapses whitespace.
+ */
+function stripHtml(html) {
+  if (!html) return "";
+
+  let text = html;
+
+  // Remove script, style, and noscript blocks (including content)
+  text = text.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ");
+  text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ");
+  text = text.replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, " ");
+
+  // Remove HTML comments
+  text = text.replace(/<!--[\s\S]*?-->/g, " ");
+
+  // Remove all HTML tags
+  text = text.replace(/<[^>]+>/g, " ");
+
+  // Decode common HTML entities
+  text = text.replace(/&amp;/g, "&");
+  text = text.replace(/&lt;/g, "<");
+  text = text.replace(/&gt;/g, ">");
+  text = text.replace(/&quot;/g, '"');
+  text = text.replace(/&#39;/g, "'");
+  text = text.replace(/&nbsp;/g, " ");
+  text = text.replace(/&#(\d+);/g, (_, code) =>
+    String.fromCharCode(parseInt(code, 10)),
+  );
+
+  // Collapse whitespace
+  text = text.replace(/\s+/g, " ").trim();
+
+  return text;
+}
+
+/**
+ * Parse DuckDuckGo HTML search results into a readable text format.
+ * Extracts titles, URLs, and snippets from result divs.
+ */
+function parseSearchResults(html) {
+  if (!html) return "No results found.";
+
+  const results = [];
+
+  // DuckDuckGo HTML results have class="result" divs with:
+  //   <a class="result__a" href="URL">Title</a>
+  //   <a class="result__snippet">Snippet text</a>
+  const resultPattern =
+    /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi;
+  const snippetPattern =
+    /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/gi;
+
+  const links = [];
+  let match;
+  while ((match = resultPattern.exec(html)) !== null) {
+    // DuckDuckGo wraps URLs through /l/?uddg=... redirects.
+    // Extract the actual target URL from the uddg parameter.
+    let url = match[1];
+    try {
+      const uddgMatch = url.match(/[?&]uddg=([^&]+)/);
+      if (uddgMatch) {
+        url = decodeURIComponent(uddgMatch[1]);
+      }
+    } catch {
+      // Keep original URL if decoding fails
+    }
+    links.push({ url, title: stripHtml(match[2]) });
+  }
+
+  const snippets = [];
+  while ((match = snippetPattern.exec(html)) !== null) {
+    snippets.push(stripHtml(match[1]));
+  }
+
+  for (let i = 0; i < Math.min(links.length, WEB_SEARCH_MAX_RESULTS); i++) {
+    const entry = `${i + 1}. ${links[i].title}\n   ${links[i].url}`;
+    const snippet = snippets[i] ? `\n   ${snippets[i]}` : "";
+    results.push(entry + snippet);
+  }
+
+  if (results.length === 0) {
+    return "No results found.";
+  }
+
+  return results.join("\n\n");
+}
+
+const MAX_REDIRECTS = 3;
+const MAX_SEARCH_QUERY_LENGTH = 500;
+
+/**
+ * Resolve hostname and validate resolved IPs against SSRF blocklist.
+ * Mitigates DNS rebinding attacks by checking the resolved IP, not just the hostname.
+ * Returns null if safe, or an error message if blocked.
+ */
+async function validateResolvedIps(hostname) {
+  const dns = require("dns").promises;
+  try {
+    const addresses = await dns.lookup(hostname, { all: true });
+    for (const addr of addresses) {
+      for (const pattern of BLOCKED_IP_PATTERNS) {
+        if (pattern.test(addr.address)) {
+          return `Blocked resolved IP: ${addr.address} for hostname ${hostname}`;
+        }
+      }
+    }
+  } catch (err) {
+    return `DNS resolution failed: ${err.message}`;
+  }
+  return null; // safe
+}
+
+/**
+ * Fetch a URL and return its content as plain text.
+ * Validates URL safety (SSRF prevention including DNS rebinding),
+ * enforces timeout, size limits, and redirect depth.
+ */
+async function executeWebFetch(url, depth = 0) {
+  if (depth > MAX_REDIRECTS) {
+    return "Error: Too many redirects";
+  }
+
+  const validationError = validateUrlSafety(url);
+  if (validationError) {
+    return `Error: ${validationError}`;
+  }
+
+  // DNS rebinding mitigation: resolve and validate IPs before connecting
+  const parsed = new URL(url);
+  const ipError = await validateResolvedIps(parsed.hostname);
+  if (ipError) {
+    return `Error: ${ipError}`;
+  }
+
+  return new Promise((resolve) => {
+    const protocol = url.startsWith("https") ? https : http;
+    const req = protocol.get(
+      url,
+      {
+        timeout: WEB_FETCH_TIMEOUT_MS,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (compatible; OpenClawBot/1.0; +https://github.com/aws-samples)",
+          Accept: "text/html,application/xhtml+xml,text/plain,*/*",
+        },
+      },
+      (res) => {
+        // Follow redirects (with depth counter)
+        if (
+          [301, 302, 303, 307, 308].includes(res.statusCode) &&
+          res.headers.location
+        ) {
+          const redirectUrl = new URL(res.headers.location, url).href;
+          const redirectError = validateUrlSafety(redirectUrl);
+          if (redirectError) {
+            resolve(`Error: Redirect blocked — ${redirectError}`);
+            return;
+          }
+          res.resume();
+          resolve(executeWebFetch(redirectUrl, depth + 1));
+          return;
+        }
+
+        if (res.statusCode >= 400) {
+          res.resume();
+          resolve(`Error: HTTP ${res.statusCode}`);
+          return;
+        }
+
+        let data = "";
+        let bytes = 0;
+        let truncated = false;
+        res.on("data", (chunk) => {
+          bytes += chunk.length;
+          if (bytes > WEB_FETCH_MAX_BYTES) {
+            truncated = true;
+            res.destroy();
+            return;
+          }
+          data += chunk;
+        });
+        res.on("end", () => {
+          const suffix = truncated
+            ? "\n\n[Content truncated at size limit]"
+            : "";
+          const text = stripHtml(data);
+          resolve(
+            (text.substring(0, WEB_FETCH_MAX_TEXT) || "(empty page)") + suffix,
+          );
+        });
+        res.on("error", (err) => {
+          resolve(`Error: ${err.message}`);
+        });
+      },
+    );
+
+    req.on("error", (err) => {
+      resolve(`Error: ${err.message}`);
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      resolve("Error: Request timed out");
+    });
+  });
+}
+
+/**
+ * Search the web using DuckDuckGo's HTML interface.
+ * No API key required. Returns formatted results.
+ */
+async function executeWebSearch(query) {
+  if (!query || typeof query !== "string" || !query.trim()) {
+    return "Error: Search query is required";
+  }
+
+  const trimmedQuery = query.trim().substring(0, MAX_SEARCH_QUERY_LENGTH);
+  const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(trimmedQuery)}`;
+
+  return new Promise((resolve) => {
+    const req = https.get(
+      searchUrl,
+      {
+        timeout: WEB_FETCH_TIMEOUT_MS,
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (compatible; OpenClawBot/1.0; +https://github.com/aws-samples)",
+          Accept: "text/html",
+        },
+      },
+      (res) => {
+        if (res.statusCode >= 400) {
+          res.resume();
+          resolve(`Error: Search failed with HTTP ${res.statusCode}`);
+          return;
+        }
+
+        let data = "";
+        let bytes = 0;
+        res.on("data", (chunk) => {
+          bytes += chunk.length;
+          if (bytes > WEB_FETCH_MAX_BYTES) {
+            res.destroy();
+            return;
+          }
+          data += chunk;
+        });
+        res.on("end", () => {
+          resolve(parseSearchResults(data));
+        });
+        res.on("error", (err) => {
+          resolve(`Error: ${err.message}`);
+        });
+      },
+    );
+
+    req.on("error", (err) => {
+      resolve(`Error: ${err.message}`);
+    });
+    req.on("timeout", () => {
+      req.destroy();
+      resolve("Error: Search request timed out");
+    });
+  });
+}
 
 /**
  * Execute write_user_file via spawn with content piped through stdin.
@@ -336,11 +720,20 @@ function buildToolArgs(toolName, args, userId) {
 }
 
 /**
- * Execute a tool by running the corresponding skill script.
+ * Execute a tool by running the corresponding skill script or in-process handler.
  * Uses execFile with array args (no shell) to prevent injection.
  * write_user_file uses stdin for content to avoid OS ARG_MAX limits.
+ * web_fetch and web_search are handled in-process (no child process).
  */
 function executeTool(toolName, args, userId) {
+  // In-process web tools (no child process spawn)
+  if (toolName === "web_fetch") {
+    return executeWebFetch(args.url);
+  }
+  if (toolName === "web_search") {
+    return executeWebSearch(args.query);
+  }
+
   // write_user_file uses spawn+stdin for content delivery
   if (toolName === "write_user_file") {
     return executeWriteTool(args, userId);
@@ -452,8 +845,9 @@ async function chat(userMessage, userId) {
 
     const choice = response.choices?.[0];
     if (!choice) {
-      console.error("[shim] No choices in proxy response");
-      return "I received an unexpected response. Please try again.";
+      const errDetail = response.error?.message || JSON.stringify(response).slice(0, 300);
+      console.error(`[shim] No choices in proxy response: ${errDetail}`);
+      return `I received an unexpected response. Please try again.`;
     }
 
     const assistantMessage = choice.message;
@@ -462,7 +856,13 @@ async function chat(userMessage, userId) {
     // If no tool calls, return the text response
     const toolCalls = assistantMessage.tool_calls;
     if (!toolCalls || toolCalls.length === 0) {
-      return assistantMessage.content || "Message processed.";
+      const text = assistantMessage.content || "Message processed.";
+      const footer =
+        "\n\n---\n" +
+        "_Warm-up mode — after full startup (~2-4 min), additional " +
+        "community skills come online: YouTube transcripts, deep research, " +
+        "task decomposition with sub-agents, etc._";
+      return text + footer;
     }
 
     // Execute tool calls
@@ -494,4 +894,14 @@ async function chat(userMessage, userId) {
   return "I ran into a limit processing your request. Please try rephrasing.";
 }
 
-module.exports = { chat, TOOLS, SCRIPT_MAP, TOOL_ENV, buildToolArgs };
+module.exports = {
+  chat,
+  TOOLS,
+  SCRIPT_MAP,
+  TOOL_ENV,
+  buildToolArgs,
+  stripHtml,
+  parseSearchResults,
+  executeWebFetch,
+  executeWebSearch,
+};

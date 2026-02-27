@@ -6,11 +6,6 @@ proxy on port 18790, and OpenClaw gateway on port 18789 (started lazily
 per user session).
 """
 
-Deploys the OpenClaw messaging bridge as a container on AgentCore Runtime,
-replacing Fargate. The container runs OpenClaw (Telegram/Discord/Slack),
-a Bedrock proxy, and an AgentCore contract server on port 8080.
-"""
-
 from aws_cdk import (
     CfnOutput,
     Duration,

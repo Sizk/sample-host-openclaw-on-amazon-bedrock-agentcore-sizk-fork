@@ -13,7 +13,7 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 - **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads)
 - **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content
 - **Messaging**: OpenClaw (Node.js) — headless mode, messages bridged via WebSocket
-- **Tools & Skills**: Built-in tool groups (full profile) + 9 ClawHub skills + 2 custom skills (S3 user files, EventBridge cron)
+- **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 2 custom skills (S3 user files, EventBridge cron) + 2 built-in shim tools (web_fetch, web_search)
 - **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
 - **Per-User File Storage**: S3-backed per-user file isolation via custom `s3-user-files` skill
 - **Workspace Persistence**: .openclaw/ directory synced to/from S3 per user
@@ -324,9 +324,9 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
    - Start OpenClaw gateway (port 18789) in background
    - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
    - Wait for proxy only (~5s)
-5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files and eventbridge-cron tools)
+5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, web_fetch, web_search tools)
 6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
-7. **After handoff**: Full OpenClaw features — `web_fetch` (no API key needed), `web_search` (needs Brave API key), 8 ClawHub skills (DuckDuckGo search, Jina reader, etc.), sub-agent support, session management
+7. **After handoff**: Full OpenClaw features — `web_fetch`, `web_search` (built-in), 5 ClawHub skills (Jina reader, deep-research-pro, etc.), sub-agent support, session management
 8. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
 9. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
 10. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
@@ -434,7 +434,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **`skills.allowBundled`**: Must be an array (e.g., `[]` for none, `["*"]` for all), not a boolean. Set to `[]` for fast startup
 - **ClawHub skill paths**: `clawhub install` installs to managed skills path — OpenClaw scans this automatically. Custom skills in `/skills/` loaded via `extraDirs`
 - **ClawHub VirusTotal flags**: Some skills flagged for external API calls — use `--no-input --force` for non-interactive Docker builds
-- **8 ClawHub skills installed**: duckduckgo-search, jina-reader, deep-research-pro, telegram-compose, transcript, hackernews, news-feed, task-decomposer
+- **5 ClawHub skills installed**: jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer (reduced from 8 — duckduckgo-search, hackernews, news-feed removed to optimize cold start; web search handled by lightweight agent's built-in web_search tool)
 - **Image updates**: New sessions use new image automatically (no keepalive restart needed)
 - **WebSocket bridge protocol**: Connect → auth (type:req, method:connect, protocol:3, auth:{token}) → agent.chat → streaming deltas → final
 - **OpenClaw 2026.2.23 breaking change**: Non-loopback bindings require `controlUi.allowedOrigins` or `dangerouslyAllowHostHeaderOriginFallback`. Solution: use localhost binding (no `--bind lan`), set `controlUi: { enabled: false, allowInsecureAuth: true, dangerouslyDisableDeviceAuth: true }`. The `dangerouslyDisableDeviceAuth` is needed for WebSocket auth without HTTPS

@@ -1,0 +1,400 @@
+"""E2E bot tests — CLI entrypoint + pytest test classes.
+
+CLI usage:
+    python -m tests.e2e.bot_test --health
+    python -m tests.e2e.bot_test --send "Hello" --tail-logs
+    python -m tests.e2e.bot_test --reset --send "Hello" --tail-logs
+    python -m tests.e2e.bot_test --reset-user
+    python -m tests.e2e.bot_test --conversation multi_turn --tail-logs
+
+Pytest usage:
+    pytest tests/e2e/bot_test.py -v -k smoke
+    pytest tests/e2e/bot_test.py -v -k cold_start
+    pytest tests/e2e/bot_test.py -v
+"""
+
+import argparse
+import sys
+import time
+
+import pytest
+
+from .config import load_config
+from .conftest import SCENARIOS
+from .log_tailer import tail_logs
+from .session import get_session_id, get_user_id, reset_session, reset_user
+from .webhook import health_check, post_webhook
+
+
+# ---------------------------------------------------------------------------
+# pytest test classes
+# ---------------------------------------------------------------------------
+
+
+class TestSmoke:
+    """Basic connectivity and webhook tests."""
+
+    def test_health_check(self, e2e_config):
+        """API Gateway /health endpoint responds 200."""
+        result = health_check(e2e_config)
+        assert result.status_code == 200, f"Health check failed: {result.status_code} {result.body}"
+        assert "ok" in result.body
+
+    def test_webhook_accepted(self, e2e_config):
+        """Telegram webhook POST returns 200 (accepted for async processing)."""
+        result = post_webhook(e2e_config, "E2E smoke test")
+        assert result.status_code == 200, f"Webhook rejected: {result.status_code} {result.body}"
+
+    def test_webhook_invalid_secret(self, e2e_config):
+        """Webhook POST with wrong secret returns 401."""
+        from .webhook import build_telegram_payload
+        from urllib import request as urllib_request
+        from urllib.error import HTTPError
+        import json
+
+        payload = build_telegram_payload(
+            e2e_config.telegram_chat_id,
+            e2e_config.telegram_user_id,
+            "This should be rejected",
+        )
+        url = f"{e2e_config.api_url}/webhook/telegram"
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib_request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "X-Telegram-Bot-Api-Secret-Token": "wrong-secret-value",
+            },
+        )
+        with pytest.raises(HTTPError) as exc_info:
+            urllib_request.urlopen(req, timeout=10)
+        assert exc_info.value.code == 401
+
+
+class TestMessageLifecycle:
+    """Full message lifecycle verification via CloudWatch logs."""
+
+    def test_send_and_verify(self, e2e_config):
+        """Send a message and verify the full lifecycle in logs."""
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(e2e_config, "E2E lifecycle test: hello!")
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Incomplete lifecycle (timed_out={tail.timed_out}, "
+            f"received={tail.message_received}, invoked={tail.agentcore_invoked}, "
+            f"sent={tail.telegram_sent})\n"
+            f"Raw lines: {tail.raw_lines[-5:]}"
+        )
+        assert tail.response_len > 0, "Response was empty"
+
+
+class TestColdStart:
+    """Cold start tests — reset session, send message, verify new session creation."""
+
+    def test_cold_start(self, e2e_config):
+        """Reset session and verify a new session is created on next message."""
+        # Ensure user exists first
+        user_id = get_user_id(e2e_config)
+        if user_id:
+            reset_session(e2e_config)
+
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(e2e_config, "E2E cold start test")
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Incomplete lifecycle after cold start "
+            f"(timed_out={tail.timed_out}, elapsed={tail.elapsed_s:.1f}s)\n"
+            f"Raw lines: {tail.raw_lines[-5:]}"
+        )
+        # New session should have been created (unless user was brand new)
+        if user_id:
+            assert tail.new_session, "Expected new session creation after reset"
+
+
+class TestWarmupShim:
+    """Verify the lightweight agent warm-up shim is responding during cold start."""
+
+    # Deterministic footer appended by the shim to every response
+    SHIM_FOOTER = "warm-up mode"
+
+    def test_cold_start_shim_response(self, e2e_config):
+        """After session reset + stop, the first response should come from
+        the warm-up shim and include the deterministic footer about
+        additional community skills coming online after full startup."""
+        from .session import _stop_agentcore_session
+
+        user_id = get_user_id(e2e_config)
+        if user_id:
+            reset_session(e2e_config)
+            _stop_agentcore_session(e2e_config)
+
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(e2e_config, "What can you do?")
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Incomplete lifecycle (timed_out={tail.timed_out})"
+        )
+
+        # The shim appends a deterministic footer about warm-up mode
+        resp_lower = tail.response_text.lower()
+        assert self.SHIM_FOOTER in resp_lower, (
+            f"Expected shim warm-up footer in response.\n"
+            f"Looked for: {self.SHIM_FOOTER!r}\n"
+            f"Response ({tail.response_len} chars): {tail.response_text[:300]}"
+        )
+
+
+class TestFullStartup:
+    """Verify OpenClaw fully starts up and ClawHub skills become available.
+
+    Unlike TestWarmupShim (which only checks the cold-start shim responds),
+    this test waits for the full OpenClaw runtime to come online. It measures
+    the timing of each phase:
+      1. Webhook → warm-up response (lightweight agent shim, ~5-15s)
+      2. Warm-up → full OpenClaw ready (no more warm-up footer, ~2-4min)
+
+    The test confirms full startup by sending a message that exercises a
+    ClawHub skill (only available after OpenClaw gateway is ready). A response
+    without the warm-up footer proves the full runtime is handling messages.
+    """
+
+    # Maximum time to wait for OpenClaw to finish starting (seconds).
+    # Typical cold start is ~2-4 min; 10 min covers slow regions/cold pulls.
+    MAX_STARTUP_WAIT_S = 600
+    POLL_INTERVAL_S = 30  # Time between status-check messages
+
+    def test_full_startup_and_skill(self, e2e_config):
+        """Reset session, wait for full OpenClaw startup, verify a
+        post-warmup response (no warm-up footer)."""
+        from .session import _stop_agentcore_session
+
+        # --- Phase 0: Force a true cold start ---
+        user_id = get_user_id(e2e_config)
+        if user_id:
+            reset_session(e2e_config)
+            _stop_agentcore_session(e2e_config)
+
+        cold_start_time = time.time()
+        cold_start_mono = time.monotonic()
+
+        # --- Phase 1: First message (warm-up shim should respond) ---
+        since_ms = int(cold_start_time * 1000)
+        result = post_webhook(e2e_config, "What tools and skills do you have?")
+        assert result.status_code == 200
+
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+        assert tail.full_lifecycle, (
+            f"Phase 1 incomplete (timed_out={tail.timed_out})"
+        )
+        warmup_response_s = time.monotonic() - cold_start_mono
+
+        # First response during cold start should be from the shim
+        assert tail.is_warmup, (
+            f"Expected warm-up shim response on cold start, but got full "
+            f"OpenClaw response in {warmup_response_s:.1f}s. "
+            f"Response: {tail.response_text[:200]}"
+        )
+
+        # --- Phase 2: Poll until OpenClaw is fully started ---
+        fully_up = False
+        full_startup_s = 0.0
+        last_response = ""
+
+        deadline = cold_start_mono + self.MAX_STARTUP_WAIT_S
+        while time.monotonic() < deadline:
+            time.sleep(self.POLL_INTERVAL_S)
+
+            since_ms = int(time.time() * 1000)
+            post_webhook(
+                e2e_config,
+                "Status check — list your available tools briefly.",
+            )
+            tail = tail_logs(
+                e2e_config, since_ms=since_ms, timeout_s=120,
+            )
+
+            if not tail.full_lifecycle:
+                continue
+
+            last_response = tail.response_text
+            if not tail.is_warmup:
+                fully_up = True
+                full_startup_s = time.monotonic() - cold_start_mono
+                break
+
+        assert fully_up, (
+            f"OpenClaw did not fully start within {self.MAX_STARTUP_WAIT_S}s. "
+            f"Still seeing warm-up footer.\n"
+            f"Last response: {last_response[:300]}"
+        )
+
+        # --- Report timing ---
+        print(f"\n  Phase 1 — warm-up response: {warmup_response_s:.1f}s")
+        print(f"  Phase 2 — full OpenClaw ready: {full_startup_s:.1f}s")
+        print(f"  Response (no warm-up footer): {last_response[:200]}")
+
+        # Sanity: full startup should take at least 30s (if faster, the shim
+        # check in phase 1 probably didn't work correctly)
+        assert full_startup_s > 30, (
+            f"Suspiciously fast full startup ({full_startup_s:.1f}s). "
+            f"The warm-up shim may not be working correctly."
+        )
+
+
+class TestConversation:
+    """Multi-message conversation tests."""
+
+    def test_conversation(self, e2e_config, conversation_scenario):
+        """Send a conversation scenario and verify each message lifecycle."""
+        name, messages = conversation_scenario
+
+        for i, msg in enumerate(messages):
+            since_ms = int(time.time() * 1000)
+            result = post_webhook(e2e_config, msg)
+            assert result.status_code == 200, f"Message {i+1}/{len(messages)} rejected"
+
+            tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=300)
+            assert tail.full_lifecycle, (
+                f"[{name}] Message {i+1}/{len(messages)} incomplete lifecycle "
+                f"(timed_out={tail.timed_out}, elapsed={tail.elapsed_s:.1f}s)"
+            )
+
+            # Delay between messages (shorter for rapid_fire)
+            if i < len(messages) - 1:
+                delay = 1 if name == "rapid_fire" else 5
+                time.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
+# CLI entrypoint
+# ---------------------------------------------------------------------------
+
+
+def _cli_health(cfg):
+    print(f"Health check: {cfg.api_url}/health")
+    result = health_check(cfg)
+    status = "OK" if result.status_code == 200 else "FAIL"
+    print(f"  {status} ({result.status_code}) — {result.elapsed_ms:.0f}ms")
+    print(f"  Body: {result.body}")
+    return result.status_code == 200
+
+
+def _cli_send(cfg, text, tail):
+    since_ms = int(time.time() * 1000)
+    print(f"Sending: {text!r}")
+    result = post_webhook(cfg, text)
+    print(f"  Webhook: {result.status_code} ({result.elapsed_ms:.0f}ms)")
+
+    if result.status_code != 200:
+        print(f"  ERROR: {result.body}")
+        return False
+
+    if not tail:
+        print("  (use --tail-logs to verify lifecycle via CloudWatch)")
+        return True
+
+    print(f"  Tailing logs (timeout=300s, poll=5s)...")
+    tail_result = tail_logs(cfg, since_ms=since_ms, timeout_s=300)
+
+    if tail_result.full_lifecycle:
+        print(f"  PASS — full lifecycle in {tail_result.elapsed_s:.1f}s")
+        if tail_result.new_session:
+            print(f"  New session: {tail_result.session_id}")
+        if tail_result.new_user:
+            print(f"  New user: {tail_result.user_id}")
+        if tail_result.response_text:
+            preview = tail_result.response_text[:200]
+            print(f"  Response ({tail_result.response_len} chars): {preview}")
+    else:
+        print(f"  INCOMPLETE — elapsed={tail_result.elapsed_s:.1f}s timed_out={tail_result.timed_out}")
+        print(f"    received={tail_result.message_received}")
+        print(f"    invoked={tail_result.agentcore_invoked}")
+        print(f"    sent={tail_result.telegram_sent}")
+        if tail_result.raw_lines:
+            print(f"  Last log lines:")
+            for line in tail_result.raw_lines[-5:]:
+                print(f"    {line.rstrip()}")
+
+    return tail_result.full_lifecycle
+
+
+def _cli_conversation(cfg, scenario_name, tail):
+    if scenario_name not in SCENARIOS:
+        print(f"Unknown scenario: {scenario_name}")
+        print(f"Available: {', '.join(SCENARIOS.keys())}")
+        return False
+
+    messages = SCENARIOS[scenario_name]
+    print(f"Conversation: {scenario_name} ({len(messages)} messages)")
+
+    all_ok = True
+    for i, msg in enumerate(messages):
+        print(f"\n  [{i+1}/{len(messages)}] {msg!r}")
+        ok = _cli_send(cfg, msg, tail)
+        if not ok:
+            all_ok = False
+        if i < len(messages) - 1:
+            delay = 1 if scenario_name == "rapid_fire" else 5
+            print(f"  Waiting {delay}s...")
+            time.sleep(delay)
+
+    return all_ok
+
+
+def main():
+    parser = argparse.ArgumentParser(description="E2E bot testing CLI")
+    parser.add_argument("--health", action="store_true", help="Health check only")
+    parser.add_argument("--send", type=str, help="Send a single message")
+    parser.add_argument("--conversation", type=str, help="Run a conversation scenario")
+    parser.add_argument("--reset", action="store_true", help="Reset session before sending")
+    parser.add_argument("--reset-user", action="store_true", help="Full user reset (delete all records)")
+    parser.add_argument("--tail-logs", action="store_true", help="Tail CloudWatch logs to verify lifecycle")
+    parser.add_argument("--timeout", type=int, default=300, help="Log tail timeout in seconds")
+    args = parser.parse_args()
+
+    try:
+        cfg = load_config()
+    except RuntimeError as e:
+        print(f"Config error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Region: {cfg.region}")
+    print(f"API URL: {cfg.api_url}")
+    print(f"Telegram user: {cfg.telegram_user_id}")
+    print()
+
+    if args.health:
+        ok = _cli_health(cfg)
+        sys.exit(0 if ok else 1)
+
+    if args.reset_user:
+        count = reset_user(cfg)
+        print(f"Reset user: deleted {count} DynamoDB records")
+        sys.exit(0)
+
+    if args.reset:
+        ok = reset_session(cfg)
+        print(f"Reset session: {'deleted' if ok else 'no session found'}")
+
+    if args.conversation:
+        ok = _cli_conversation(cfg, args.conversation, args.tail_logs)
+        sys.exit(0 if ok else 1)
+
+    if args.send:
+        ok = _cli_send(cfg, args.send, args.tail_logs)
+        sys.exit(0 if ok else 1)
+
+    if not any([args.health, args.send, args.conversation, args.reset, args.reset_user]):
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

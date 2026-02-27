@@ -651,6 +651,11 @@ const VALID_CHANNELS = new Set([
   "unknown",
 ]);
 
+async function retrieveMemoryContext(_actorId, _lastUserText) {
+  // Stub — memory retrieval not yet implemented.
+  return "";
+}
+
 async function buildUserIdentityContext(actorId, channel) {
   const safeChannel = VALID_CHANNELS.has(channel) ? channel : "unknown";
   const namespace = actorId.replace(/:/g, "_");
@@ -1354,18 +1359,6 @@ const server = http.createServer(async (req, res) => {
           );
         }
 
-        // Build augmented system text with user identity context.
-        const identityContext = await buildUserIdentityContext(
-          actorId,
-          channel,
-        );
-        const systemMessages = messages.filter((m) => m.role === "system");
-        const baseSystemText =
-          systemMessages.length > 0
-            ? systemMessages.map((m) => m.content).join("\n")
-            : SYSTEM_PROMPT;
-        const systemTextOverride = baseSystemText + identityContext;
-
         // --- Convert OpenAI tools to Bedrock toolConfig ---
         const toolConfig = convertTools(parsed.tools);
         if (toolConfig) {
@@ -1458,15 +1451,7 @@ const server = http.createServer(async (req, res) => {
           systemMessages.length > 0
             ? systemMessages.map((m) => m.content).join("\n")
             : SYSTEM_PROMPT;
-        const systemTextOverride = baseSystemText + identityContext;
-
-        // --- Convert OpenAI tools to Bedrock toolConfig ---
-        const toolConfig = convertTools(parsed.tools);
-        if (toolConfig) {
-          console.log(
-            `[proxy] Tools: ${toolConfig.tools.length} tool(s) forwarded to Bedrock`,
-          );
-        }
+        const systemTextOverride = baseSystemText + identityContext + memoryContext;
 
         // --- Direct Bedrock path ---
         if (stream) {

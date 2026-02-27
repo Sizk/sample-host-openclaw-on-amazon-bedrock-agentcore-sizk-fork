@@ -1,0 +1,139 @@
+"""DynamoDB session and user management for E2E tests."""
+
+from typing import Optional
+
+import boto3
+from botocore.exceptions import ClientError
+
+from .config import E2EConfig
+
+
+def _get_table(cfg: E2EConfig):
+    dynamodb = boto3.resource("dynamodb", region_name=cfg.region)
+    return dynamodb.Table(cfg.identity_table)
+
+
+def get_user_id(cfg: E2EConfig) -> Optional[str]:
+    """Look up the user ID for the E2E Telegram user."""
+    table = _get_table(cfg)
+    channel_key = f"telegram:{cfg.telegram_user_id}"
+    try:
+        resp = table.get_item(Key={"PK": f"CHANNEL#{channel_key}", "SK": "PROFILE"})
+        item = resp.get("Item")
+        return item["userId"] if item else None
+    except ClientError:
+        return None
+
+
+def get_session_id(cfg: E2EConfig, user_id: str) -> Optional[str]:
+    """Get the current session ID for a user."""
+    table = _get_table(cfg)
+    try:
+        resp = table.get_item(Key={"PK": f"USER#{user_id}", "SK": "SESSION"})
+        item = resp.get("Item")
+        return item["sessionId"] if item else None
+    except ClientError:
+        return None
+
+
+def reset_session(cfg: E2EConfig) -> bool:
+    """Delete the session record for the E2E user, forcing a new session on next message.
+
+    Returns True if a session was deleted, False if no session existed.
+    """
+    user_id = get_user_id(cfg)
+    if not user_id:
+        return False
+
+    table = _get_table(cfg)
+    try:
+        resp = table.delete_item(
+            Key={"PK": f"USER#{user_id}", "SK": "SESSION"},
+            ReturnValues="ALL_OLD",
+        )
+        return "Attributes" in resp
+    except ClientError:
+        return False
+
+
+def _stop_agentcore_session(cfg: E2EConfig) -> bool:
+    """Stop the AgentCore runtime session for the E2E user.
+
+    This terminates the container, ensuring the next message triggers a
+    true cold start (new container pull + init).
+
+    Returns True if session was stopped, False if already terminated.
+    """
+    user_id = get_user_id(cfg)
+    if not user_id:
+        return False
+
+    session_id = get_session_id(cfg, user_id)
+    if not session_id:
+        return False
+
+    client = boto3.client("bedrock-agentcore", region_name=cfg.region)
+
+    # Resolve the runtime ARN from CloudFormation outputs
+    cf = boto3.client("cloudformation", region_name=cfg.region)
+    try:
+        stacks = cf.describe_stacks(StackName="OpenClawAgentCore")
+        outputs = stacks["Stacks"][0].get("Outputs", [])
+        runtime_arn = next(
+            (o["OutputValue"] for o in outputs if o["OutputKey"] == "RuntimeArn"),
+            None,
+        )
+    except (ClientError, StopIteration, IndexError):
+        return False
+
+    if not runtime_arn:
+        return False
+
+    try:
+        client.stop_runtime_session(
+            agentRuntimeArn=runtime_arn,
+            runtimeSessionId=session_id,
+        )
+        return True
+    except ClientError:
+        # Session already terminated
+        return False
+
+
+def reset_user(cfg: E2EConfig) -> int:
+    """Delete all DynamoDB records for the E2E Telegram user.
+
+    Removes: CHANNEL# mapping, USER# profile, USER#/SESSION, USER#/CHANNEL# back-ref.
+    Returns the count of items deleted.
+    """
+    table = _get_table(cfg)
+    channel_key = f"telegram:{cfg.telegram_user_id}"
+    deleted = 0
+
+    # Find user ID first
+    user_id = get_user_id(cfg)
+
+    # Delete channel mapping
+    try:
+        table.delete_item(Key={"PK": f"CHANNEL#{channel_key}", "SK": "PROFILE"})
+        deleted += 1
+    except ClientError:
+        pass
+
+    if not user_id:
+        return deleted
+
+    # Delete user profile, session, and channel back-reference
+    keys_to_delete = [
+        {"PK": f"USER#{user_id}", "SK": "PROFILE"},
+        {"PK": f"USER#{user_id}", "SK": "SESSION"},
+        {"PK": f"USER#{user_id}", "SK": f"CHANNEL#{channel_key}"},
+    ]
+    for key in keys_to_delete:
+        try:
+            table.delete_item(Key=key)
+            deleted += 1
+        except ClientError:
+            pass
+
+    return deleted

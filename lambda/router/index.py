@@ -413,7 +413,7 @@ def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
                 body_text = body.read().decode("utf-8")
             else:
                 body_text = str(body)
-            logger.info("AgentCore response body (first 500 chars): %s", body_text[:500])
+            logger.info("AgentCore response body (first 2000 chars): %s", body_text[:2000])
             try:
                 return json.loads(body_text)
             except json.JSONDecodeError:
@@ -783,7 +783,7 @@ def handle_telegram(body):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw
     response_text = _extract_text_from_content_blocks(response_text)
-    logger.info("Response to send (len=%d): %s", len(response_text), response_text[:200])
+    logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
 
     # Send response (split if > 4096 chars for Telegram limit)
     if len(response_text) <= 4096:

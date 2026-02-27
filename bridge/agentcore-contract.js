@@ -55,7 +55,7 @@ let initPromise = null;
 let secretsPrefetchPromise = null;
 let startTime = Date.now();
 let shuttingDown = false;
-const BUILD_VERSION = "v24"; // Bump in cdk.json to force container redeploy
+const BUILD_VERSION = "v30"; // Bump in cdk.json to force container redeploy
 
 // OpenClaw process diagnostics (last N lines of stdout/stderr)
 const OPENCLAW_LOG_LIMIT = 50;
@@ -101,6 +101,47 @@ async function prefetchSecrets() {
 }
 
 /**
+ * Clean up stale .lock files in the .openclaw directory (async, non-blocking).
+ * Prevents "session file locked" errors after workspace restore from S3.
+ */
+async function cleanupLockFiles() {
+  const fs = require("fs");
+  const path = require("path");
+  const homeDir = process.env.HOME || "/root";
+  const openclawDir = path.join(homeDir, ".openclaw");
+
+  try {
+    await fs.promises.access(openclawDir);
+  } catch {
+    return; // Directory doesn't exist yet — nothing to clean
+  }
+
+  async function walkAndClean(dir) {
+    let entries;
+    try {
+      entries = await fs.promises.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const tasks = [];
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        tasks.push(walkAndClean(fullPath));
+      } else if (entry.name.endsWith(".lock")) {
+        tasks.push(
+          fs.promises.unlink(fullPath).catch(() => {}),
+        );
+      }
+    }
+    await Promise.all(tasks);
+  }
+
+  await walkAndClean(openclawDir);
+  console.log("[contract] Lock file cleanup complete (async)");
+}
+
+/**
  * Check if the proxy health endpoint responds.
  */
 function checkProxyHealth() {
@@ -121,6 +162,48 @@ function checkProxyHealth() {
       req.destroy();
       resolve(null);
     });
+  });
+}
+
+/**
+ * Send a lightweight request to the proxy to trigger JIT compilation
+ * of the request handling path. Makes the first real user message faster.
+ */
+function warmProxyJit() {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify({
+      model: "bedrock-agentcore",
+      messages: [{ role: "user", content: "warmup" }],
+      max_tokens: 1,
+      stream: false,
+    });
+    const req = http.request(
+      {
+        hostname: "127.0.0.1",
+        port: PROXY_PORT,
+        path: "/v1/chat/completions",
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(payload),
+        },
+        timeout: 10000,
+      },
+      (res) => {
+        res.resume();
+        res.on("end", () => {
+          console.log("[contract] Proxy JIT warm-up complete");
+          resolve();
+        });
+      },
+    );
+    req.on("error", () => resolve());
+    req.on("timeout", () => {
+      req.destroy();
+      resolve();
+    });
+    req.write(payload);
+    req.end();
   });
 }
 
@@ -285,13 +368,10 @@ function writeOpenClawConfig() {
         "## Community Skills (ClawHub)",
         "",
         "The following community skills are pre-installed:",
-        "- **duckduckgo-search**: Web search via DuckDuckGo (no API key needed)",
-        "- **jina-reader**: Extract web content as clean markdown",
+        "- **jina-reader**: Extract web content as clean markdown (higher quality than built-in web_fetch)",
         "- **deep-research-pro**: In-depth multi-step research on complex topics (uses sub-agents)",
         "- **telegram-compose**: Rich HTML formatting for Telegram messages",
         "- **transcript**: YouTube video transcript extraction",
-        "- **hackernews**: Browse and search Hacker News",
-        "- **news-feed**: RSS-based news aggregation",
         "- **task-decomposer**: Break complex requests into manageable subtasks (uses sub-agents)",
         "",
         "## Sub-agents",
@@ -364,24 +444,11 @@ async function init(userId, actorId, channel) {
       );
     }
 
-    // 1b. Clean up stale lock files restored from S3 (prevents "session file locked" errors)
-    try {
-      const _fs = require("fs");
-      const { execSync } = require("child_process");
-      const _home = process.env.HOME || "/root";
-      const locks = execSync(
-        `find ${_home}/.openclaw -name '*.lock' -type f 2>/dev/null || true`,
-        { encoding: "utf8" },
-      ).trim();
-      if (locks) {
-        for (const lockFile of locks.split("\n").filter(Boolean)) {
-          _fs.unlinkSync(lockFile);
-        }
-        console.log(`[contract] Cleaned up stale lock files`);
-      }
-    } catch (err) {
+    // 1b. Clean up stale lock files restored from S3 (non-blocking)
+    // Runs in parallel with proxy startup — does not block init.
+    const lockCleanupPromise = cleanupLockFiles().catch((err) => {
       console.warn(`[contract] Lock cleanup failed: ${err.message}`);
-    }
+    });
 
     // 2. Start the Bedrock proxy with user identity env vars
     // Only pass required env vars — avoid leaking secrets via process.env spread
@@ -409,6 +476,9 @@ async function init(userId, actorId, channel) {
       console.log(`[contract] Proxy exited with code ${code}`);
       proxyReady = false;
     });
+
+    // Wait for lock cleanup to complete before starting OpenClaw
+    await lockCleanupPromise;
 
     // Write OpenClaw config and start gateway (non-blocking)
     writeOpenClawConfig();
@@ -454,6 +524,10 @@ async function init(userId, actorId, channel) {
     if (!proxyReady) {
       throw new Error("Proxy failed to start within 30s");
     }
+
+    // 2b. Warm proxy JIT — send a lightweight request to trigger V8 compilation
+    // of the request handling path, so the first real user message is faster.
+    warmProxyJit().catch(() => {}); // non-blocking, fire-and-forget
 
     // 3. Poll for OpenClaw readiness in the background (don't block)
     pollOpenClawReadiness(namespace).catch((err) => {

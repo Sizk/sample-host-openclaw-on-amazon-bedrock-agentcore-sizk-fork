@@ -1,12 +1,13 @@
 /**
- * Tests for lightweight-agent.js — cron tool additions.
+ * Tests for lightweight-agent.js — tool definitions, buildToolArgs, and web tools.
  *
- * Covers: TOOLS definitions, SCRIPT_MAP, TOOL_ENV, and buildToolArgs logic.
+ * Covers: TOOLS definitions, SCRIPT_MAP, TOOL_ENV, buildToolArgs logic,
+ *         web_fetch and web_search in-process tools, stripHtml, parseSearchResults.
  * Run: cd bridge && node --test lightweight-agent.test.js
  */
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { TOOLS, SCRIPT_MAP, TOOL_ENV, buildToolArgs } = require("./lightweight-agent");
+const { TOOLS, SCRIPT_MAP, TOOL_ENV, buildToolArgs, stripHtml, parseSearchResults, executeWebFetch, executeWebSearch } = require("./lightweight-agent");
 
 // --- TOOLS array ---
 
@@ -20,9 +21,11 @@ describe("TOOLS", () => {
     "list_schedules",
     "update_schedule",
     "delete_schedule",
+    "web_fetch",
+    "web_search",
   ];
 
-  it("contains all 8 expected tools", () => {
+  it("contains all 10 expected tools", () => {
     const names = TOOLS.map((t) => t.function.name);
     assert.deepStrictEqual(names, EXPECTED_TOOLS);
   });
@@ -80,6 +83,20 @@ describe("TOOLS", () => {
     const tool = TOOLS.find((t) => t.function.name === "delete_schedule");
     assert.deepStrictEqual(tool.function.parameters.required, ["schedule_id"]);
   });
+
+  it("web_fetch requires url", () => {
+    const tool = TOOLS.find((t) => t.function.name === "web_fetch");
+    assert.ok(tool, "web_fetch tool should exist");
+    assert.deepStrictEqual(tool.function.parameters.required, ["url"]);
+    assert.ok(tool.function.parameters.properties.url);
+  });
+
+  it("web_search requires query", () => {
+    const tool = TOOLS.find((t) => t.function.name === "web_search");
+    assert.ok(tool, "web_search tool should exist");
+    assert.deepStrictEqual(tool.function.parameters.required, ["query"]);
+    assert.ok(tool.function.parameters.properties.query);
+  });
 });
 
 // --- SCRIPT_MAP ---
@@ -88,7 +105,7 @@ describe("SCRIPT_MAP", () => {
   it("has an entry for every tool in TOOLS", () => {
     for (const tool of TOOLS) {
       const name = tool.function.name;
-      assert.ok(SCRIPT_MAP[name], `SCRIPT_MAP missing entry for ${name}`);
+      assert.ok(name in SCRIPT_MAP, `SCRIPT_MAP missing entry for ${name}`);
     }
   });
 
@@ -104,6 +121,11 @@ describe("SCRIPT_MAP", () => {
     assert.equal(SCRIPT_MAP.write_user_file, "/skills/s3-user-files/write.js");
     assert.equal(SCRIPT_MAP.list_user_files, "/skills/s3-user-files/list.js");
     assert.equal(SCRIPT_MAP.delete_user_file, "/skills/s3-user-files/delete.js");
+  });
+
+  it("web tools are marked as in-process (no script path)", () => {
+    assert.equal(SCRIPT_MAP.web_fetch, null);
+    assert.equal(SCRIPT_MAP.web_search, null);
   });
 });
 
@@ -418,5 +440,225 @@ describe("CLI arg alignment with script argv positions", () => {
     const args = buildToolArgs("delete_schedule", { schedule_id: "ff00ff00" }, "telegram_999");
     assert.equal(args[1], "telegram_999"); // argv[2]
     assert.equal(args[2], "ff00ff00"); // argv[3]
+  });
+});
+
+// --- stripHtml ---
+
+describe("stripHtml", () => {
+  it("removes simple HTML tags", () => {
+    assert.equal(stripHtml("<p>Hello</p>"), "Hello");
+  });
+
+  it("removes nested tags", () => {
+    assert.equal(stripHtml("<div><p><b>Bold</b> text</p></div>"), "Bold text");
+  });
+
+  it("handles script and style tags by removing content", () => {
+    const html = '<p>Before</p><script>alert("xss")</script><p>After</p>';
+    const result = stripHtml(html);
+    assert.ok(!result.includes("alert"), "should remove script content");
+    assert.ok(result.includes("Before"));
+    assert.ok(result.includes("After"));
+  });
+
+  it("handles style tags by removing content", () => {
+    const html = "<p>Text</p><style>body { color: red; }</style><p>More</p>";
+    const result = stripHtml(html);
+    assert.ok(!result.includes("color"), "should remove style content");
+    assert.ok(result.includes("Text"));
+    assert.ok(result.includes("More"));
+  });
+
+  it("handles noscript tags by removing content", () => {
+    const html = "<p>Main</p><noscript><p>Enable JS</p></noscript><p>End</p>";
+    const result = stripHtml(html);
+    assert.ok(!result.includes("Enable JS"), "should remove noscript content");
+    assert.ok(result.includes("Main"));
+    assert.ok(result.includes("End"));
+  });
+
+  it("removes HTML comments", () => {
+    const html = "<p>Visible</p><!-- secret comment --><p>Also visible</p>";
+    const result = stripHtml(html);
+    assert.ok(!result.includes("secret"), "should remove comment content");
+    assert.ok(result.includes("Visible"));
+    assert.ok(result.includes("Also visible"));
+  });
+
+  it("decodes common HTML entities", () => {
+    assert.ok(stripHtml("&amp;").includes("&"));
+    assert.ok(stripHtml("&lt;").includes("<"));
+    assert.ok(stripHtml("&gt;").includes(">"));
+    assert.ok(stripHtml("&quot;").includes('"'));
+    assert.ok(stripHtml("&#39;").includes("'"));
+    // &nbsp; decodes to space — verify in context (standalone trims away)
+    assert.ok(stripHtml("hello&nbsp;world").includes("hello world"));
+  });
+
+  it("collapses multiple whitespace into single spaces", () => {
+    const result = stripHtml("<p>Hello</p>   \n\n   <p>World</p>");
+    // Should not have excessive whitespace
+    assert.ok(!result.includes("   "), "should collapse whitespace");
+  });
+
+  it("returns empty string for empty input", () => {
+    assert.equal(stripHtml(""), "");
+  });
+
+  it("returns plain text unchanged", () => {
+    assert.equal(stripHtml("No HTML here"), "No HTML here");
+  });
+});
+
+// --- parseSearchResults ---
+
+describe("parseSearchResults", () => {
+  it("extracts results from DuckDuckGo-style HTML", () => {
+    const html = `
+      <div class="result">
+        <a class="result__a" href="https://example.com">Example Title</a>
+        <a class="result__snippet">This is the snippet text</a>
+      </div>
+      <div class="result">
+        <a class="result__a" href="https://other.com">Other Page</a>
+        <a class="result__snippet">Another snippet</a>
+      </div>
+    `;
+    const result = parseSearchResults(html);
+    assert.ok(result.includes("Example Title"), "should include first title");
+    assert.ok(result.includes("https://example.com"), "should include first URL");
+    assert.ok(result.includes("Other Page"), "should include second title");
+  });
+
+  it("returns 'no results' message for empty HTML", () => {
+    const result = parseSearchResults("");
+    assert.ok(result.toLowerCase().includes("no") || result.length === 0 || result.includes("No results"));
+  });
+
+  it("returns 'no results' message for HTML with no search results", () => {
+    const result = parseSearchResults("<html><body><p>Nothing here</p></body></html>");
+    assert.ok(result.includes("No results") || result.includes("no results") || result.trim().length === 0);
+  });
+
+  it("extracts actual URLs from DuckDuckGo redirect wrappers", () => {
+    const html = `
+      <div class="result">
+        <a class="result__a" href="/l/?kh=-1&uddg=https%3A%2F%2Fexample.com%2Fpage">Example</a>
+        <a class="result__snippet">A snippet</a>
+      </div>
+    `;
+    const result = parseSearchResults(html);
+    assert.ok(result.includes("https://example.com/page"), "should decode uddg URL");
+    assert.ok(!result.includes("uddg"), "should not include redirect params");
+  });
+
+  it("limits results to reasonable count", () => {
+    // Build HTML with many results
+    let html = "";
+    for (let i = 0; i < 20; i++) {
+      html += `<div class="result"><a class="result__a" href="https://example${i}.com">Title ${i}</a><a class="result__snippet">Snippet ${i}</a></div>`;
+    }
+    const result = parseSearchResults(html);
+    // Should not return all 20 — should cap at a reasonable number
+    const urlCount = (result.match(/https:\/\/example/g) || []).length;
+    assert.ok(urlCount <= 10, `should limit results, got ${urlCount}`);
+  });
+});
+
+// --- buildToolArgs for web tools ---
+
+describe("buildToolArgs for web tools", () => {
+  const USER_ID = "telegram_12345";
+
+  it("web_fetch returns null (in-process, not a script tool)", () => {
+    const result = buildToolArgs("web_fetch", { url: "https://example.com" }, USER_ID);
+    assert.equal(result, null);
+  });
+
+  it("web_search returns null (in-process, not a script tool)", () => {
+    const result = buildToolArgs("web_search", { query: "test query" }, USER_ID);
+    assert.equal(result, null);
+  });
+});
+
+// --- executeWebFetch ---
+
+describe("executeWebFetch", () => {
+  it("is a function", () => {
+    assert.equal(typeof executeWebFetch, "function");
+  });
+
+  it("rejects invalid URLs", async () => {
+    const result = await executeWebFetch("not-a-url");
+    assert.ok(result.startsWith("Error:"), `should return error, got: ${result}`);
+  });
+
+  it("rejects empty URL", async () => {
+    const result = await executeWebFetch("");
+    assert.ok(result.startsWith("Error:"), `should return error, got: ${result}`);
+  });
+
+  it("rejects non-http protocols", async () => {
+    const result = await executeWebFetch("ftp://example.com");
+    assert.ok(result.startsWith("Error:"), `should reject ftp, got: ${result}`);
+  });
+
+  it("rejects file:// protocol", async () => {
+    const result = await executeWebFetch("file:///etc/passwd");
+    assert.ok(result.startsWith("Error:"), `should reject file://, got: ${result}`);
+  });
+
+  it("rejects private IP addresses (SSRF prevention)", async () => {
+    const result = await executeWebFetch("http://127.0.0.1/secret");
+    assert.ok(result.startsWith("Error:"), `should reject localhost, got: ${result}`);
+  });
+
+  it("rejects 10.x.x.x addresses (SSRF prevention)", async () => {
+    const result = await executeWebFetch("http://10.0.0.1/metadata");
+    assert.ok(result.startsWith("Error:"), `should reject private IP, got: ${result}`);
+  });
+
+  it("rejects 169.254.169.254 (AWS metadata SSRF)", async () => {
+    const result = await executeWebFetch("http://169.254.169.254/latest/meta-data/");
+    assert.ok(result.startsWith("Error:"), `should reject metadata endpoint, got: ${result}`);
+  });
+
+  it("rejects IPv4-mapped IPv6 loopback (::ffff:127.0.0.1)", async () => {
+    const result = await executeWebFetch("http://[::ffff:127.0.0.1]/secret");
+    assert.ok(result.startsWith("Error:"), `should reject IPv4-mapped loopback, got: ${result}`);
+  });
+
+  it("rejects IPv4-mapped IPv6 private (::ffff:10.0.0.1)", async () => {
+    const result = await executeWebFetch("http://[::ffff:10.0.0.1]/internal");
+    assert.ok(result.startsWith("Error:"), `should reject IPv4-mapped private, got: ${result}`);
+  });
+
+  it("rejects IPv4-mapped IPv6 metadata (::ffff:169.254.169.254)", async () => {
+    const result = await executeWebFetch("http://[::ffff:169.254.169.254]/meta-data/");
+    assert.ok(result.startsWith("Error:"), `should reject IPv4-mapped IMDS, got: ${result}`);
+  });
+
+  it("rejects 192.168.x.x addresses", async () => {
+    const result = await executeWebFetch("http://192.168.1.1/admin");
+    assert.ok(result.startsWith("Error:"), `should reject 192.168, got: ${result}`);
+  });
+
+  it("rejects 172.16-31.x.x addresses", async () => {
+    const result = await executeWebFetch("http://172.16.0.1/internal");
+    assert.ok(result.startsWith("Error:"), `should reject 172.16, got: ${result}`);
+  });
+});
+
+// --- executeWebSearch ---
+
+describe("executeWebSearch", () => {
+  it("is a function", () => {
+    assert.equal(typeof executeWebSearch, "function");
+  });
+
+  it("rejects empty query", async () => {
+    const result = await executeWebSearch("");
+    assert.ok(result.startsWith("Error:") || result.includes("No results"), `should handle empty query, got: ${result}`);
   });
 });
