@@ -6,10 +6,12 @@ CLI usage:
     python -m tests.e2e.bot_test --reset --send "Hello" --tail-logs
     python -m tests.e2e.bot_test --reset-user
     python -m tests.e2e.bot_test --conversation multi_turn --tail-logs
+    python -m tests.e2e.bot_test --subagent --tail-logs
 
 Pytest usage:
     pytest tests/e2e/bot_test.py -v -k smoke
     pytest tests/e2e/bot_test.py -v -k cold_start
+    pytest tests/e2e/bot_test.py -v -k subagent
     pytest tests/e2e/bot_test.py -v
 """
 
@@ -22,7 +24,7 @@ import pytest
 from .config import load_config
 from .conftest import SCENARIOS
 from .log_tailer import tail_logs
-from .session import get_session_id, get_user_id, reset_session, reset_user
+from .session import get_agent_status, get_session_id, get_user_id, reset_session, reset_user
 from .webhook import health_check, post_webhook
 
 
@@ -248,6 +250,197 @@ class TestFullStartup:
         )
 
 
+# ---------------------------------------------------------------------------
+# Shared helper: wait for full OpenClaw startup
+# ---------------------------------------------------------------------------
+
+_OPENCLAW_STARTUP_TIMEOUT_S = 600  # Max wait for full cold start (slow regions)
+_SUBAGENT_TIMEOUT_S = 600  # Sub-agent skills may take several minutes
+
+
+def _wait_for_full_openclaw(e2e_config, max_wait_s=_OPENCLAW_STARTUP_TIMEOUT_S,
+                            poll_interval_s=30):
+    """Wait for OpenClaw to be fully started (not in warm-up mode).
+
+    Sends periodic status-check messages until the response no longer
+    contains the warm-up footer. Sleeps before the first probe to avoid
+    wasting a poll cycle when called immediately after a cold start.
+
+    Returns (is_ready, elapsed_s).
+    """
+    start = time.monotonic()
+
+    while (time.monotonic() - start) < max_wait_s:
+        # Sleep before probing — avoids wasting a 120s tail_logs cycle
+        # when the session is known to be cold (just started/reset).
+        time.sleep(poll_interval_s)
+
+        since_ms = int(time.time() * 1000)
+        post_webhook(e2e_config, "Quick status check")
+        tail = tail_logs(e2e_config, since_ms=since_ms, timeout_s=120)
+
+        if tail.full_lifecycle and not tail.is_warmup:
+            return True, time.monotonic() - start
+
+    return False, time.monotonic() - start
+
+
+class TestSubagent:
+    """Verify sub-agent skills work after full OpenClaw startup.
+
+    Tests deep-research-pro and task-decomposer skills, which spawn
+    sub-agents for parallel work. Requires OpenClaw to be fully started
+    (not in warm-up mode).
+
+    After each skill invocation, queries the contract status endpoint to
+    verify that subagentRequestCount increased — definitive proof that
+    OpenClaw subagents actually fired (not just that the skill responded).
+
+    These tests are slower than other E2E tests because:
+    1. They may need to wait for full OpenClaw startup (~2-4 min)
+    2. Sub-agent skills take longer to execute than simple responses
+
+    Run with: pytest tests/e2e/bot_test.py -v -k subagent
+    """
+
+    # Minimum response length thresholds. Simple responses are typically
+    # <200 chars; sub-agent skill output should be substantially longer.
+    MIN_TASK_DECOMPOSE_LEN = 100
+    MIN_DEEP_RESEARCH_LEN = 200
+
+    @pytest.fixture(scope="class", autouse=True)
+    def ensure_full_openclaw(self, e2e_config):
+        """Wait for full OpenClaw startup once before all subagent tests."""
+        ready, elapsed = _wait_for_full_openclaw(e2e_config)
+        assert ready, f"OpenClaw not fully started after {elapsed:.0f}s"
+        print(f"\n  OpenClaw ready in {elapsed:.1f}s")
+
+    @staticmethod
+    def _get_subagent_count(e2e_config):
+        """Query contract status for current subagentRequestCount.
+
+        Returns the count, or None if the status endpoint is unavailable.
+        """
+        status = get_agent_status(e2e_config)
+        if status is None:
+            return None
+        return status.get("subagentRequestCount")
+
+    def test_task_decomposer_skill(self, e2e_config):
+        """Send a task decomposition request and verify structured output.
+
+        The task-decomposer skill spawns sub-agents to break complex
+        requests into manageable subtasks. Verifies the response is
+        substantial, came from full OpenClaw (not warm-up shim), and
+        that subagentRequestCount increased.
+        """
+        baseline_count = self._get_subagent_count(e2e_config)
+
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            "Break down the task of building a REST API into subtasks",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(
+            e2e_config, since_ms=since_ms, timeout_s=_SUBAGENT_TIMEOUT_S,
+        )
+        assert tail.full_lifecycle, (
+            f"Incomplete lifecycle (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+        assert not tail.is_warmup, (
+            "Response came from warm-up shim, not full OpenClaw. "
+            "Task-decomposer skill not available during warm-up."
+        )
+        assert tail.response_len >= self.MIN_TASK_DECOMPOSE_LEN, (
+            f"Response too short ({tail.response_len} chars) for task "
+            f"decomposition. Expected structured subtask output.\n"
+            f"Response: {tail.response_text[:300]}"
+        )
+
+        # Verify subagent requests actually fired
+        after_count = self._get_subagent_count(e2e_config)
+        if baseline_count is not None and after_count is not None:
+            assert after_count > baseline_count, (
+                f"subagentRequestCount did not increase after task-decomposer "
+                f"(before={baseline_count}, after={after_count}). "
+                f"Subagents may not have fired."
+            )
+            print(
+                f"  Subagent count: {baseline_count} -> {after_count} "
+                f"(+{after_count - baseline_count})"
+            )
+        else:
+            print(
+                f"  Subagent count: status endpoint unavailable "
+                f"(baseline={baseline_count}, after={after_count})"
+            )
+
+        print(
+            f"  Task decomposer response ({tail.response_len} chars, "
+            f"{tail.elapsed_s:.1f}s): {tail.response_text[:300]}"
+        )
+
+    def test_deep_research_skill(self, e2e_config):
+        """Send a deep research request and verify detailed output.
+
+        The deep-research-pro skill spawns sub-agents for multi-step
+        research on complex topics. Verifies the response is detailed,
+        came from full OpenClaw (not warm-up shim), and that
+        subagentRequestCount increased.
+        """
+        baseline_count = self._get_subagent_count(e2e_config)
+
+        since_ms = int(time.time() * 1000)
+        result = post_webhook(
+            e2e_config,
+            "Research the latest advances in quantum computing",
+        )
+        assert result.status_code == 200
+
+        tail = tail_logs(
+            e2e_config, since_ms=since_ms, timeout_s=_SUBAGENT_TIMEOUT_S,
+        )
+        assert tail.full_lifecycle, (
+            f"Incomplete lifecycle (timed_out={tail.timed_out}, "
+            f"elapsed={tail.elapsed_s:.1f}s)"
+        )
+        assert not tail.is_warmup, (
+            "Response came from warm-up shim, not full OpenClaw. "
+            "Deep-research-pro skill not available during warm-up."
+        )
+        assert tail.response_len >= self.MIN_DEEP_RESEARCH_LEN, (
+            f"Response too short ({tail.response_len} chars) for deep "
+            f"research. Expected multi-section research output.\n"
+            f"Response: {tail.response_text[:300]}"
+        )
+
+        # Verify subagent requests actually fired
+        after_count = self._get_subagent_count(e2e_config)
+        if baseline_count is not None and after_count is not None:
+            assert after_count > baseline_count, (
+                f"subagentRequestCount did not increase after deep-research "
+                f"(before={baseline_count}, after={after_count}). "
+                f"Subagents may not have fired."
+            )
+            print(
+                f"  Subagent count: {baseline_count} -> {after_count} "
+                f"(+{after_count - baseline_count})"
+            )
+        else:
+            print(
+                f"  Subagent count: status endpoint unavailable "
+                f"(baseline={baseline_count}, after={after_count})"
+            )
+
+        print(
+            f"  Deep research response ({tail.response_len} chars, "
+            f"{tail.elapsed_s:.1f}s): {tail.response_text[:300]}"
+        )
+
+
 class TestConversation:
     """Multi-message conversation tests."""
 
@@ -286,7 +479,7 @@ def _cli_health(cfg):
     return result.status_code == 200
 
 
-def _cli_send(cfg, text, tail):
+def _cli_send(cfg, text, tail, timeout_s=300):
     since_ms = int(time.time() * 1000)
     print(f"Sending: {text!r}")
     result = post_webhook(cfg, text)
@@ -300,8 +493,8 @@ def _cli_send(cfg, text, tail):
         print("  (use --tail-logs to verify lifecycle via CloudWatch)")
         return True
 
-    print(f"  Tailing logs (timeout=300s, poll=5s)...")
-    tail_result = tail_logs(cfg, since_ms=since_ms, timeout_s=300)
+    print(f"  Tailing logs (timeout={timeout_s}s, poll=5s)...")
+    tail_result = tail_logs(cfg, since_ms=since_ms, timeout_s=timeout_s)
 
     if tail_result.full_lifecycle:
         print(f"  PASS — full lifecycle in {tail_result.elapsed_s:.1f}s")
@@ -323,6 +516,37 @@ def _cli_send(cfg, text, tail):
                 print(f"    {line.rstrip()}")
 
     return tail_result.full_lifecycle
+
+
+def _cli_subagent(cfg, tail):
+    """Run sub-agent skill tests: task-decomposer and deep-research-pro.
+
+    Always polls CloudWatch during startup wait (regardless of --tail-logs),
+    then uses the tail flag for the actual skill invocation logs.
+    """
+    print("Sub-agent skill tests (requires full OpenClaw startup)")
+    print("Waiting for OpenClaw to be fully started...")
+
+    ready, elapsed = _wait_for_full_openclaw(cfg)
+    if not ready:
+        print(f"  FAIL — OpenClaw not fully started after {elapsed:.0f}s")
+        return False
+    print(f"  OpenClaw ready in {elapsed:.1f}s\n")
+
+    prompts = [
+        ("task-decomposer", "Break down the task of building a REST API into subtasks"),
+        ("deep-research-pro", "Research the latest advances in quantum computing"),
+    ]
+
+    all_ok = True
+    for skill_name, prompt in prompts:
+        print(f"Testing {skill_name}...")
+        ok = _cli_send(cfg, prompt, tail, timeout_s=_SUBAGENT_TIMEOUT_S)
+        if not ok:
+            all_ok = False
+        print()
+
+    return all_ok
 
 
 def _cli_conversation(cfg, scenario_name, tail):
@@ -353,6 +577,7 @@ def main():
     parser.add_argument("--health", action="store_true", help="Health check only")
     parser.add_argument("--send", type=str, help="Send a single message")
     parser.add_argument("--conversation", type=str, help="Run a conversation scenario")
+    parser.add_argument("--subagent", action="store_true", help="Test sub-agent skills (requires full startup)")
     parser.add_argument("--reset", action="store_true", help="Reset session before sending")
     parser.add_argument("--reset-user", action="store_true", help="Full user reset (delete all records)")
     parser.add_argument("--tail-logs", action="store_true", help="Tail CloudWatch logs to verify lifecycle")
@@ -383,6 +608,10 @@ def main():
         ok = reset_session(cfg)
         print(f"Reset session: {'deleted' if ok else 'no session found'}")
 
+    if args.subagent:
+        ok = _cli_subagent(cfg, args.tail_logs)
+        sys.exit(0 if ok else 1)
+
     if args.conversation:
         ok = _cli_conversation(cfg, args.conversation, args.tail_logs)
         sys.exit(0 if ok else 1)
@@ -391,7 +620,8 @@ def main():
         ok = _cli_send(cfg, args.send, args.tail_logs)
         sys.exit(0 if ok else 1)
 
-    if not any([args.health, args.send, args.conversation, args.reset, args.reset_user]):
+    if not any([args.health, args.send, args.conversation, args.subagent,
+                args.reset, args.reset_user]):
         parser.print_help()
         sys.exit(1)
 

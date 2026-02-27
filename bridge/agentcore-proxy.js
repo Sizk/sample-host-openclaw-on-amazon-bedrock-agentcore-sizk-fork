@@ -19,6 +19,10 @@ if (!AWS_REGION) {
 const MODEL_ID =
   process.env.BEDROCK_MODEL_ID || "global.anthropic.claude-opus-4-6-v1";
 
+// Subagent model routing — distinct model name lets proxy detect subagent requests
+const SUBAGENT_MODEL_NAME = process.env.SUBAGENT_MODEL_NAME || "bedrock-agentcore-subagent";
+const SUBAGENT_BEDROCK_MODEL_ID = process.env.SUBAGENT_BEDROCK_MODEL_ID || MODEL_ID;
+
 // Cognito identity configuration
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
 const COGNITO_CLIENT_ID = process.env.COGNITO_CLIENT_ID || "";
@@ -27,6 +31,7 @@ const COGNITO_PASSWORD_SECRET = process.env.COGNITO_PASSWORD_SECRET || "";
 // Diagnostic state — exposed via /health for observability (container stdout not in CloudWatch)
 let lastIdentityDiag = null;
 let chatRequestCount = 0;
+let subagentRequestCount = 0;
 
 const SYSTEM_PROMPT =
   "You are a helpful personal assistant powered by OpenClaw. You are friendly, " +
@@ -974,10 +979,35 @@ function convertMessages(messages) {
 }
 
 /**
+ * Determine if the incoming request is from a subagent.
+ * Returns true when the requested model name matches the distinct subagent model name.
+ */
+function isSubagentRequest(parsed) {
+  if (!parsed || !parsed.model) return false;
+  const requested = parsed.model;
+  // Match both "bedrock-agentcore-subagent" and "agentcore/bedrock-agentcore-subagent"
+  return requested === SUBAGENT_MODEL_NAME ||
+    requested.endsWith(`/${SUBAGENT_MODEL_NAME}`);
+}
+
+/**
+ * Resolve the Bedrock model ID based on the requested model name.
+ * Subagent requests → SUBAGENT_BEDROCK_MODEL_ID, everything else → MODEL_ID.
+ */
+function resolveModelId(requestedModel) {
+  if (!requestedModel) return MODEL_ID;
+  if (requestedModel === SUBAGENT_MODEL_NAME ||
+      requestedModel.endsWith(`/${SUBAGENT_MODEL_NAME}`)) {
+    return SUBAGENT_BEDROCK_MODEL_ID;
+  }
+  return MODEL_ID;
+}
+
+/**
  * Call Bedrock Converse API (non-streaming).
  * Accepts optional systemTextOverride and toolConfig for tool use.
  */
-async function invokeBedrock(messages, systemTextOverride, toolConfig) {
+async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel) {
   const {
     BedrockRuntimeClient,
     ConverseCommand,
@@ -985,9 +1015,10 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig) {
   const client = new BedrockRuntimeClient({ region: AWS_REGION });
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
+  const modelId = resolveModelId(requestedModel);
 
   const params = {
-    modelId: MODEL_ID,
+    modelId,
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
     inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
@@ -1070,9 +1101,10 @@ async function invokeBedrockStreaming(
   const client = new BedrockRuntimeClient({ region: AWS_REGION });
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
+  const modelId = resolveModelId(model);
 
   const params = {
-    modelId: MODEL_ID,
+    modelId,
     messages: bedrockMessages,
     system: [{ text: finalSystemText }],
     inferenceConfig: { maxTokens: 2048, temperature: 0.7 },
@@ -1309,9 +1341,12 @@ const server = http.createServer(async (req, res) => {
       JSON.stringify({
         status: "ok",
         model: MODEL_ID,
+        subagent_model: SUBAGENT_BEDROCK_MODEL_ID,
+        subagent_model_name: SUBAGENT_MODEL_NAME,
         cognito: COGNITO_USER_POOL_ID ? "configured" : "disabled",
         s3_bucket: process.env.S3_USER_FILES_BUCKET || "not configured",
-        chat_requests: chatRequestCount,
+        total_requests: chatRequestCount,
+        subagent_requests: subagentRequestCount,
         last_identity: lastIdentityDiag,
         installed_skills: installedSkills,
         s3_skill_exists: s3SkillExists,
@@ -1338,6 +1373,16 @@ const server = http.createServer(async (req, res) => {
         const { sessionId, actorId, channel, idSource } =
           extractSessionMetadata(parsed, req.headers);
         chatRequestCount++;
+
+        // Detect and count subagent requests
+        const isSubagent = isSubagentRequest(parsed);
+        if (isSubagent) {
+          subagentRequestCount++;
+          console.log(
+            `[proxy] Subagent request #${subagentRequestCount}: model=${parsed.model}, messages=${messages.length}`,
+          );
+        }
+
         // Store identity diagnostic (visible via /health since container stdout not in CloudWatch)
         lastIdentityDiag = {
           actorId,
@@ -1467,6 +1512,7 @@ const server = http.createServer(async (req, res) => {
             processedMessages,
             systemTextOverride,
             toolConfig,
+            parsed.model,
           );
           const response = formatChatResponse(result, parsed.model);
           console.log(

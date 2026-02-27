@@ -253,6 +253,10 @@ async function waitForPort(port, label, timeoutMs = 300000, intervalMs = 3000) {
   return false;
 }
 
+// Distinct subagent model name — proxy uses this to detect and route subagent requests.
+// Must match the SUBAGENT_MODEL_NAME env var passed to the proxy.
+const SUBAGENT_MODEL_NAME = "bedrock-agentcore-subagent";
+
 /**
  * Write a headless OpenClaw config (no channels — messages bridged via WebSocket).
  * Full tool profile with deny list for unsafe/irrelevant tools.
@@ -262,9 +266,9 @@ async function waitForPort(port, label, timeoutMs = 300000, intervalMs = 3000) {
 function writeOpenClawConfig() {
   const fs = require("fs");
 
-  // Sub-agent model: defaults to main model, configurable via SUBAGENT_MODEL env var
-  const subagentModel =
-    process.env.SUBAGENT_MODEL || "agentcore/bedrock-agentcore";
+  // Sub-agent model uses a distinct name so the proxy can identify subagent requests.
+  // The proxy maps this name → SUBAGENT_BEDROCK_MODEL_ID (or MODEL_ID fallback).
+  const subagentModel = `agentcore/${SUBAGENT_MODEL_NAME}`;
 
   const config = {
     models: {
@@ -273,7 +277,10 @@ function writeOpenClawConfig() {
           baseUrl: `http://127.0.0.1:${PROXY_PORT}/v1`,
           apiKey: "local",
           api: "openai-completions",
-          models: [{ id: "bedrock-agentcore", name: "Bedrock AgentCore" }],
+          models: [
+            { id: "bedrock-agentcore", name: "Bedrock AgentCore" },
+            { id: SUBAGENT_MODEL_NAME, name: "Bedrock AgentCore Subagent" },
+          ],
         },
       },
     },
@@ -464,6 +471,8 @@ async function init(userId, actorId, channel) {
       COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
       COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
       S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
+      SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
+      SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
       USER_ID: actorId,
       CHANNEL: channel,
       OPENCLAW_SKIP_CRON: "1", // Disable internal cron — EventBridge handles scheduling
@@ -900,6 +909,9 @@ const server = http.createServer(async (req, res) => {
 
         // Status check (no init needed)
         if (action === "status") {
+          // Fetch proxy /health for request counters (non-blocking — null on failure)
+          const proxyHealth = await checkProxyHealth();
+
           const diag = {
             buildVersion: BUILD_VERSION,
             uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
@@ -910,6 +922,8 @@ const server = http.createServer(async (req, res) => {
             openclawExitCode,
             openclawPid: openclawProcess?.pid || null,
             openclawLogs: openclawLogs.slice(-20),
+            totalRequestCount: proxyHealth?.total_requests ?? null,
+            subagentRequestCount: proxyHealth?.subagent_requests ?? null,
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ response: JSON.stringify(diag) }));

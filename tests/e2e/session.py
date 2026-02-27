@@ -1,5 +1,6 @@
 """DynamoDB session and user management for E2E tests."""
 
+import json
 from typing import Optional
 
 import boto3
@@ -137,3 +138,66 @@ def reset_user(cfg: E2EConfig) -> int:
             pass
 
     return deleted
+
+
+def get_agent_status(cfg: E2EConfig) -> Optional[dict]:
+    """Query the AgentCore contract status endpoint for a user's session.
+
+    Invokes the contract server's ``action: status`` which returns diagnostics
+    including chatRequestCount and subagentRequestCount from the proxy /health.
+
+    Returns the parsed status dict, or None if the session doesn't exist or
+    the invocation fails.
+    """
+    user_id = get_user_id(cfg)
+    if not user_id:
+        return None
+
+    session_id = get_session_id(cfg, user_id)
+    if not session_id:
+        return None
+
+    # Resolve runtime ARN and qualifier from CloudFormation
+    cf = boto3.client("cloudformation", region_name=cfg.region)
+    try:
+        stacks = cf.describe_stacks(StackName="OpenClawAgentCore")
+        outputs = stacks["Stacks"][0].get("Outputs", [])
+        runtime_arn = next(
+            (o["OutputValue"] for o in outputs if o["OutputKey"] == "RuntimeArn"),
+            None,
+        )
+        qualifier = next(
+            (o["OutputValue"] for o in outputs
+             if o["OutputKey"] == "RuntimeEndpointArn"),
+            None,
+        )
+    except (ClientError, StopIteration, IndexError):
+        return None
+
+    if not runtime_arn:
+        return None
+
+    client = boto3.client("bedrock-agentcore", region_name=cfg.region)
+    payload = json.dumps({"action": "status"}).encode()
+
+    try:
+        resp = client.invoke_agent_runtime(
+            agentRuntimeArn=runtime_arn,
+            qualifier=qualifier or "",
+            runtimeSessionId=session_id,
+            payload=payload,
+            contentType="application/json",
+            accept="application/json",
+        )
+        body = resp.get("response")
+        if body:
+            body_text = (body.read().decode("utf-8")
+                         if hasattr(body, "read") else str(body))
+            outer = json.loads(body_text)
+            # The contract wraps status in {"response": JSON.stringify(diag)}
+            inner = outer.get("response", "{}")
+            return json.loads(inner) if isinstance(inner, str) else inner
+    except Exception:
+        return None
+
+    return None

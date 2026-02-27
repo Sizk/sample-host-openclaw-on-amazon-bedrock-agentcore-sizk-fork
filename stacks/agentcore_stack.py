@@ -224,8 +224,10 @@ class AgentCoreStack(Stack):
                 "CRON_LEAD_TIME_MINUTES": str(
                     self.node.try_get_context("cron_lead_time_minutes") or "5"
                 ),
-                # Sub-agent model: empty = use same as default_model_id
-                "SUBAGENT_MODEL": subagent_model_id,
+                # Sub-agent model: empty = use same as default_model_id.
+                # SUBAGENT_BEDROCK_MODEL_ID is forwarded by the contract server
+                # to the proxy for Bedrock model routing.
+                "SUBAGENT_BEDROCK_MODEL_ID": subagent_model_id,
             },
             description="OpenClaw messaging bridge on AgentCore Runtime (per-user sessions)",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(

@@ -1,6 +1,6 @@
 ---
 name: e2e-bot-testing
-description: "Run automated E2E tests against the deployed OpenClaw bot — webhook simulation, session reset, CloudWatch log verification, full OpenClaw startup timing, and ClawHub skill validation. Use this skill whenever testing a deployment, verifying cold start behavior, checking if OpenClaw is fully up, measuring startup phase timing, or diagnosing why messages fail."
+description: "Run automated E2E tests against the deployed OpenClaw bot — webhook simulation, session reset, CloudWatch log verification, full OpenClaw startup timing, ClawHub skill validation, and sub-agent skill verification. Use this skill whenever testing a deployment, verifying cold start behavior, checking if OpenClaw is fully up, measuring startup phase timing, testing sub-agent skills (deep-research-pro, task-decomposer), or diagnosing why messages fail."
 user-invocable: true
 ---
 
@@ -28,6 +28,7 @@ export CDK_DEFAULT_REGION=ap-southeast-2
 | `pytest tests/e2e/bot_test.py -v -k cold_start` | Cold start (new session creation) |
 | `pytest tests/e2e/bot_test.py -v -k warmup` | Verify warm-up shim footer present |
 | `pytest tests/e2e/bot_test.py -v -k full_startup` | Wait for full OpenClaw + timing |
+| `pytest tests/e2e/bot_test.py -v -k subagent` | Sub-agent skill verification |
 | `pytest tests/e2e/bot_test.py -v -k conversation` | Multi-turn conversation tests |
 | `pytest tests/e2e/bot_test.py -v` | All E2E tests |
 | `pytest -m "not e2e"` | Skip E2E tests in fast CI |
@@ -41,6 +42,7 @@ export CDK_DEFAULT_REGION=ap-southeast-2
 | `python -m tests.e2e.bot_test --reset --send "Hello" --tail-logs` | Cold start test |
 | `python -m tests.e2e.bot_test --reset-user` | Full user reset |
 | `python -m tests.e2e.bot_test --conversation multi_turn --tail-logs` | Multi-turn test |
+| `python -m tests.e2e.bot_test --subagent --tail-logs` | Sub-agent skill test |
 
 ## Startup Phases and Timing
 
@@ -86,6 +88,41 @@ These skills are only available after OpenClaw fully starts. Requesting one duri
 | `task-decomposer` | `"Break down the task of building a REST API"` |
 
 The `TestFullStartup` test waits for full startup and verifies responses no longer contain the warm-up footer, confirming ClawHub skills are available.
+
+### Sub-agent skill verification (TestSubagent)
+
+Two ClawHub skills spawn sub-agents for parallel work: `deep-research-pro` and `task-decomposer`. The `TestSubagent` class verifies these skills produce substantial responses after full OpenClaw startup.
+
+```bash
+# Run sub-agent tests only
+pytest tests/e2e/bot_test.py -v -k subagent
+
+# Ad-hoc CLI testing
+python -m tests.e2e.bot_test --subagent --tail-logs
+```
+
+**What the tests verify:**
+1. OpenClaw is fully started (not in warm-up mode)
+2. `task-decomposer` produces structured output (>100 chars) for a decomposition request
+3. `deep-research-pro` produces detailed output (>200 chars) for a research request
+4. Responses come from full OpenClaw, not the lightweight warm-up shim
+
+**What the tests cannot verify** (observability gap):
+- Whether sub-agents were actually spawned (container stdout not in CloudWatch)
+- Whether the proxy received multiple requests (one per sub-agent)
+- Which model the sub-agents used
+
+The tests are behavioral smoke tests — they confirm the skills produce substantial output after full startup. If sub-agent execution is fundamentally broken (sandbox misconfigured, model routing fails, skill loading fails), the response would be an error or a short deflection, failing the length assertion.
+
+**Sub-agent configuration path** (for debugging failures):
+```
+cdk.json: subagent_model_id → agentcore_stack.py: SUBAGENT_MODEL env →
+  agentcore-contract.js: writeOpenClawConfig() →
+    openclaw.json: agents.defaults.subagents.model = "agentcore/bedrock-agentcore"
+      → proxy at 127.0.0.1:18790 → Bedrock ConverseStream (hardcoded MODEL_ID)
+```
+
+**Known limitation**: The proxy ignores the `model` field from OpenAI requests (`agentcore-proxy.js:990,1075`). All requests — main agent and sub-agents — use the same `BEDROCK_MODEL_ID`. The `subagent_model_id` config in `cdk.json` has no effect on model selection.
 
 ## How It Works
 
@@ -133,6 +170,7 @@ The `AgentCore response body` line contains JSON: `{"response": "full text..."}`
 | `TestColdStart` | New session creation after reset | ✓ | |
 | `TestWarmupShim` | Warm-up footer present on cold start | ✓ | ✓ |
 | `TestFullStartup` | Full OpenClaw ready + phase timing | ✓ | ✓ |
+| `TestSubagent` | Sub-agent skill verification | | |
 | `TestConversation` | Multi-turn scenarios | | |
 
 ### Conversation Scenarios
@@ -210,7 +248,11 @@ pytest tests/e2e/bot_test.py -v -k warmup
 #    (This takes 3-5+ min — it polls until warm-up footer disappears)
 pytest tests/e2e/bot_test.py -v -k full_startup
 
-# 6. Conversations — multi-turn and rapid-fire
+# 6. Sub-agent skills — verify deep-research-pro and task-decomposer
+#    (Requires full OpenClaw; waits for startup if needed)
+pytest tests/e2e/bot_test.py -v -k subagent
+
+# 7. Conversations — multi-turn and rapid-fire
 pytest tests/e2e/bot_test.py -v -k conversation
 
 # Or run everything:
@@ -252,6 +294,7 @@ If new log lines are added to `lambda/router/index.py`:
 |-----------|---------|-------|
 | Log tail | 300s | Accommodates cold start (~2-4 min) |
 | Full startup poll | 600s | Waits for full OpenClaw (10 min max) |
+| Sub-agent skill timeout | 600s | Sub-agent skills may take several minutes |
 | Startup poll interval | 30s | Between status-check messages |
 | Webhook POST | 30s | API Gateway timeout |
 | Health check | 10s | Simple GET |
@@ -288,6 +331,9 @@ This means diagnostic messages like `[contract] OpenClaw ready`, `[contract] Ope
 | New container code not taking effect | AgentCore caches image digests at deploy time | Bump `image_version` in cdk.json AND run `cdk deploy` |
 | Cold start test gets warm response | Old container still running | Stop AgentCore session AND delete DDB session record |
 | Multiple sessions created during tests | Each test run may create a new session | Expected — each session independently cold-starts |
+| Sub-agent test: short response | Skill didn't invoke sub-agents, or model answered directly | Check `openclaw.json` has correct `subagents` config; verify skill is loaded (`ls /skills/`) |
+| Sub-agent test: warm-up response | OpenClaw not fully started | Test waits 10 min max; check container logs for startup errors |
+| Sub-agent test: timeout | Sub-agent processing exceeded Lambda timeout | Check `router_lambda_timeout_seconds` (default 300s); sub-agent tasks may need longer |
 
 ### Docker Container Diagnostics
 
