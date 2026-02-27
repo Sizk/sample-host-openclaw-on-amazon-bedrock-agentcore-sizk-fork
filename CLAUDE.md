@@ -113,7 +113,7 @@ openclaw-on-agentcore/
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
     lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron tools)
-    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 35 tests)
+    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 70 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
@@ -144,7 +144,7 @@ openclaw-on-agentcore/
     architecture.md               # Detailed architecture diagrams
 ```
 
-## CDK Stacks (6 stacks)
+## CDK Stacks (7 stacks)
 
 | Stack | Key Resources | Dependencies |
 |---|---|---|
@@ -170,27 +170,18 @@ cdk destroy --all                            # tear down
 
 ### Build & Push Bridge Image (after CDK deploy creates ECR repo)
 ```bash
-source .venv/bin/activate
-cdk synth                                    # synthesize + cdk-nag checks
-cdk deploy --all --require-approval never    # deploy all stacks
-cdk deploy OpenClawAgentCore                 # deploy single stack
-cdk diff                                     # preview changes
-cdk destroy --all                            # tear down
-```
-
-### Build & Push Bridge Image (after CDK deploy creates ECR repo)
-```bash
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 export CDK_DEFAULT_REGION=us-west-2  # change to your preferred region
 
 aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
   docker login --username AWS --password-stdin \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com
-docker build --platform linux/arm64 -t openclaw-bridge bridge/
-docker tag openclaw-bridge:latest \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
+VERSION=$(python3 -c "import json; print(json.load(open('cdk.json'))['context']['image_version'])")
+docker build --platform linux/arm64 -t openclaw-bridge:v${VERSION} bridge/
+docker tag openclaw-bridge:v${VERSION} \
+  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 docker push \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
+  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 ```
 
 ### Webhook Setup (Telegram)
@@ -319,18 +310,17 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 2. **agentcore-contract.js** (port 8080): Responds to `/ping` with `Healthy` immediately
 3. **On first `/invocations` with `action: chat` or `action: warmup`** (lazy init):
    - Fetch secrets from Secrets Manager (gateway token, Cognito secret)
-   - Restore `.openclaw/` from S3 via `workspace-sync.js`
    - Start `agentcore-proxy.js` (port 18790) with `USER_ID`/`CHANNEL` env vars
    - Start OpenClaw gateway (port 18789) in background
    - Restore `.openclaw/` from S3 via `workspace-sync.js` in background
    - Wait for proxy only (~5s)
-5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, web_fetch, web_search tools)
-6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
-7. **After handoff**: Full OpenClaw features — `web_fetch`, `web_search` (built-in), 5 ClawHub skills (Jina reader, deep-research-pro, etc.), sub-agent support, session management
-8. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
-9. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
-10. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
-11. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
+4. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, web_fetch, web_search tools)
+5. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
+6. **After handoff**: Full OpenClaw features — `web_fetch`, `web_search` (built-in), 5 ClawHub skills (Jina reader, deep-research-pro, etc.), sub-agent support, session management
+7. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
+8. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
+9. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
+10. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ## DynamoDB Identity Table Schema
 

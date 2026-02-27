@@ -29,8 +29,6 @@ OpenClaw runs as **per-user serverless containers** on AgentCore Runtime. A Rout
 
 Users can send **text and images** — photos sent via Telegram or Slack are downloaded by the Router Lambda, stored in S3, and passed to Claude as multimodal content via Bedrock's ConverseStream API. Supported formats: JPEG, PNG, GIF, WebP (max 3.75 MB).
 
-Users can send **text and images** — photos sent via Telegram or Slack are downloaded by the Router Lambda, stored in S3, and passed to Claude as multimodal content via Bedrock's ConverseStream API. Supported formats: JPEG, PNG, GIF, WebP (max 3.75 MB).
-
 ## Architecture
 
 ```mermaid
@@ -82,46 +80,6 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Automated compliance**: cdk-nag AwsSolutions checks on every `cdk synth`
 
 See [SECURITY.md](SECURITY.md) for the complete security architecture.
-
-### Why S3 Workspace Sync?
-
-AgentCore Runtime is a **serverless** platform — each user session runs in an ephemeral microVM that is created on demand and destroyed when idle. This creates a fundamental challenge: OpenClaw stores its state on the local filesystem in the `.openclaw/` directory, including configuration (`openclaw.json`), conversation memory (`MEMORY.md`), user profiles (`USER.md`, `IDENTITY.md`), agent instructions (`AGENTS.md`, `SOUL.md`), and tool output files. Without persistence, all of this is lost every time a session terminates.
-
-The solution is **S3-backed workspace sync**:
-
-- **On session start**: The contract server restores the user's `.openclaw/` directory from S3 before starting OpenClaw. This gives the agent access to the user's full conversation history, preferences, and prior context as if the session had never ended.
-- **Periodically (every 5 min)**: A background timer saves the workspace back to S3, so in-progress state is protected against unexpected failures.
-- **On session shutdown (SIGTERM)**: A final save runs within the 15-second grace period AgentCore provides before terminating the microVM, capturing all state changes from the session.
-
-Each user's workspace is isolated under a unique S3 prefix (`{namespace}/.openclaw/`) derived from their channel identity (e.g., `telegram_6087229962`). Large files (>10MB), build artifacts (`node_modules/`), and cache directories are excluded from sync to keep storage costs low and restore times fast.
-
-This design lets the system behave like a persistent server from the user's perspective (continuous conversation history, remembering preferences across sessions) while benefiting from serverless economics (no idle compute costs, automatic scaling, per-user isolation).
-
-### Security
-
-This solution applies defense-in-depth across the network, application, identity, and data layers:
-
-**Network isolation** — AgentCore containers run in private VPC subnets with no direct internet exposure. All AWS service access goes through VPC endpoints (S3, Secrets Manager, Bedrock, ECR, CloudWatch, STS, DynamoDB). The only public entry point is the API Gateway HTTP API.
-
-**Webhook authentication** — Every incoming webhook request is cryptographically validated before processing. Telegram webhooks are verified via the `X-Telegram-Bot-Api-Secret-Token` header (registered with Telegram's `setWebhook` API). Slack webhooks are verified using HMAC-SHA256 signature validation with a 5-minute replay attack window. Validation is fail-closed — requests are rejected if secrets are not configured.
-
-**API surface minimization** — The API Gateway exposes only three explicit routes (`POST /webhook/telegram`, `POST /webhook/slack`, `GET /health`). All other paths return 404 from API Gateway itself without invoking the Lambda. Rate limiting (burst: 50, sustained: 100 req/s) provides DDoS protection.
-
-**Secret management** — All sensitive values (bot tokens, webhook secrets, Cognito password secret, gateway token) are stored in AWS Secrets Manager encrypted with a customer-managed KMS key. Secrets are fetched at runtime and held in process memory only — never written to environment variables, config files, or logs.
-
-**Least-privilege IAM** — Each component has tightly scoped permissions: the Router Lambda can only invoke the specific AgentCore Runtime (not `Resource: *`), Cognito operations are scoped to the specific user pool, and Secrets Manager access is limited to the `openclaw/*` prefix.
-
-**Per-user isolation** — Each user runs in their own AgentCore microVM with a dedicated S3 namespace. There is no shared state between users. Namespace derivation is system-controlled (from the channel identity) and cannot be influenced by user input.
-
-**Container hardening** — The bridge container runs as a non-root user (`openclaw`, uid 1001). Request body size is limited to 1MB to prevent memory exhaustion. Internal error details and stack traces are never exposed in API responses.
-
-**Encryption** — Data is encrypted at rest (S3 with KMS, DynamoDB with AWS-managed keys, Secrets Manager with CMK) and in transit (TLS for all AWS API calls, HTTPS for API Gateway). CloudTrail provides a full audit trail of API activity.
-
-**Identity** — Cognito User Pool provides per-user identity with HMAC-derived passwords (deterministic, never stored). AgentCore WorkloadIdentity integrates with Cognito OIDC for JWT-based authentication.
-
-**Observability** — CloudWatch dashboards and alarms monitor Lambda errors, latency, and throttling. Token usage is tracked per user via custom CloudWatch metrics with budget alarms.
-
-**Automated compliance** — Every `cdk synth` runs [cdk-nag](https://github.com/cdklabs/cdk-nag) AwsSolutions checks against the entire infrastructure, catching misconfigurations before deployment.
 
 ## Prerequisites
 
@@ -198,14 +156,17 @@ aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
   docker login --username AWS --password-stdin \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com
 
+# Read version from cdk.json for versioned image tags
+VERSION=$(python3 -c "import json; print(json.load(open('cdk.json'))['context']['image_version'])")
+
 # Build ARM64 image (required by AgentCore Runtime)
-docker build --platform linux/arm64 -t openclaw-bridge bridge/
+docker build --platform linux/arm64 -t openclaw-bridge:v${VERSION} bridge/
 
 # Tag and push
-docker tag openclaw-bridge:latest \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
+docker tag openclaw-bridge:v${VERSION} \
+  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 docker push \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
+  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 ```
 
 ### 6. Store your Telegram bot token
@@ -282,7 +243,7 @@ openclaw-on-agentcore/
     entrypoint.sh                 # Startup: configure IPv4, start contract server
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
     lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron tools)
-    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 35 tests)
+    lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 70 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
@@ -300,6 +261,14 @@ openclaw-on-agentcore/
     setup-telegram.sh             # Telegram webhook + admin allowlist (one-step)
     setup-slack.sh                # Slack Event Subscriptions + admin allowlist
     manage-allowlist.sh           # Add/remove/list users in the allowlist
+  tests/
+    e2e/                          # E2E tests (simulated Telegram webhooks + CloudWatch logs)
+      config.py                   # AWS config auto-discovery (CF outputs, Secrets Manager)
+      webhook.py                  # Build + POST Telegram webhook payloads
+      session.py                  # DynamoDB session/user reset + AgentCore session stop
+      log_tailer.py               # CloudWatch log tailing with pattern matching
+      bot_test.py                 # CLI entrypoint + pytest test classes (11 tests)
+      conftest.py                 # pytest fixtures, conversation scenarios
   docs/
     architecture.md               # Detailed architecture diagram
 ```
@@ -545,7 +514,7 @@ Each user's schedules are isolated — no cross-user access. Schedule metadata i
    - Wait for proxy only (~5s)
 5. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files and eventbridge-cron tools — users can manage files and schedules immediately)
 6. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
-7. **After handoff**: Full OpenClaw features — built-in web tools (`web_search`, `web_fetch`), 8 ClawHub skills, sub-agent support, session management
+7. **After handoff**: Full OpenClaw features — built-in web tools (`web_search`, `web_fetch`), 5 ClawHub skills (jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer), sub-agent support, session management
 8. **SIGTERM**: Save `.openclaw/` to S3, kill child processes, exit
 
 ### Message Flow
@@ -567,17 +536,19 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 | `eventbridge-cron` | Cron scheduling via EventBridge Scheduler — create, update, and delete recurring tasks |
 | `s3-user-files` | Per-user file storage (S3-backed) — read, write, list, and delete files |
 
-> **Note**: ClawHub community skills (duckduckgo-search, jina-reader, etc.) are **disabled** in the Dockerfile due to ARM64 cross-compilation issues with QEMU. To enable them, uncomment lines 22-30 in `bridge/Dockerfile` and build on native ARM64 hardware (e.g., EC2 Graviton or Apple Silicon without emulation).
+Five ClawHub community skills are pre-installed at Docker build time:
+
+| ClawHub Skill | Purpose |
+|---|---|
+| `jina-reader` | Extract web content as clean markdown |
+| `deep-research-pro` | In-depth multi-step research (spawns sub-agents) |
+| `telegram-compose` | Rich HTML formatting for Telegram messages |
+| `transcript` | YouTube video transcript extraction |
+| `task-decomposer` | Break complex requests into subtasks (spawns sub-agents) |
+
+During the warm-up phase (~first 2-4 min on cold start), the **lightweight agent shim** handles messages with built-in `web_fetch` and `web_search` tools, plus `s3-user-files` and `eventbridge-cron` skills. ClawHub skills become available after OpenClaw fully starts.
 
 ### Webhook Security
-
-The Router Lambda validates all incoming webhook requests:
-
-- **Telegram**: Validates the `X-Telegram-Bot-Api-Secret-Token` header against the `openclaw/webhook-secret` stored in Secrets Manager. The secret is registered with Telegram via the `secret_token` parameter on `setWebhook`.
-- **Slack**: Validates the `X-Slack-Signature` HMAC-SHA256 header using the Slack app's signing secret. Includes 5-minute timestamp check to prevent replay attacks.
-- **API Gateway**: Only explicit routes are exposed (`POST /webhook/telegram`, `POST /webhook/slack`, `GET /health`). All other paths return 404 from API Gateway without invoking the Lambda. Rate limiting is applied (burst: 50, sustained: 100 req/s).
-
-Requests that fail validation receive a 401 response and are logged with the source IP.
 
 The Router Lambda validates all incoming webhook requests:
 
@@ -618,14 +589,15 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 # 1. Bump image_version in cdk.json (or use -c image_version=N on the CLI)
 #    This forces AgentCore to pull the new container image.
 # 2. Build + push image
-docker build --platform linux/arm64 -t openclaw-bridge bridge/
-docker tag openclaw-bridge:latest \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
+VERSION=$(python3 -c "import json; print(json.load(open('cdk.json'))['context']['image_version'])")
+docker build --platform linux/arm64 -t openclaw-bridge:v${VERSION} bridge/
+docker tag openclaw-bridge:v${VERSION} \
+  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
   docker login --username AWS --password-stdin \
   $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com
 docker push \
-  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:latest
+  $CDK_DEFAULT_ACCOUNT.dkr.ecr.$CDK_DEFAULT_REGION.amazonaws.com/openclaw-bridge:v${VERSION}
 # 3. CDK deploy
 cdk deploy OpenClawAgentCore --require-approval never
 # 4. New sessions will use the new image automatically (per-user idle termination)
@@ -640,8 +612,14 @@ cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 cd lambda/router && python -m pytest test_image_upload.py -v   # image upload unit tests
 
-# E2E tests (requires deployed stack and configured environment)
-cd tests/e2e && python -m pytest bot_test.py -v        # simulated Telegram webhook E2E tests
+# E2E tests (requires deployed stack + E2E_TELEGRAM_CHAT_ID/E2E_TELEGRAM_USER_ID env vars)
+pytest tests/e2e/bot_test.py -v -k smoke               # connectivity + webhook auth
+pytest tests/e2e/bot_test.py -v -k lifecycle            # full message lifecycle
+pytest tests/e2e/bot_test.py -v -k cold_start           # new session creation
+pytest tests/e2e/bot_test.py -v -k warmup               # warm-up shim verification
+pytest tests/e2e/bot_test.py -v -k full_startup          # full OpenClaw startup + timing (~5min)
+pytest tests/e2e/bot_test.py -v -k conversation          # multi-turn + rapid-fire
+pytest tests/e2e/bot_test.py -v                          # all E2E tests
 ```
 
 ### Security validation
@@ -701,10 +679,10 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 
 | Limitation | Details |
 |---|---|
-| **Cold start time** | ~4 minutes for first message to a new user (OpenClaw initialization + plugin registration) |
+| **Cold start time** | Lightweight agent responds in ~5-15s; full OpenClaw ready in ~2-4 min (plugin registration) |
 | **Image size** | Max 3.75 MB per image (Bedrock Converse API limit) |
 | **Session timeout** | Sessions terminate after 30 min idle (configurable via `session_idle_timeout`) |
-| **ClawHub skills** | Disabled by default — ARM64 cross-compilation issues with QEMU (see [Tools & Skills](#tools--skills)) |
+| **ClawHub skills** | 5 pre-installed; available only after full OpenClaw startup (~2-4 min). During warm-up, built-in web_fetch/web_search tools are available |
 | **Single region** | AgentCore Runtime deployed in one region; no multi-region failover |
 | **No voice/video** | Only text and images supported; no audio or video messages |
 
@@ -718,7 +696,7 @@ Node.js 22's Happy Eyeballs (`autoSelectFamily`) tries both IPv4 and IPv6. In VP
 - **CDK RetentionDays**: `logs.RetentionDays` is an enum, not constructable from int. Use the helper in `stacks/__init__.py`.
 - **Cognito passwords**: HMAC-derived (`HMAC-SHA256(secret, actorId)`) — deterministic, never stored. Enables `AdminInitiateAuth` without per-user password storage.
 - **`skills.allowBundled` is an array**: OpenClaw expects `["*"]` (not `true`) — boolean causes config validation failure.
-- **ClawHub skills**: 8 community skills are pre-installed at Docker build time. Custom skills (s3-user-files, eventbridge-cron) are in `/skills/` loaded via `extraDirs`. ClawHub installs to the managed skills path, scanned automatically by OpenClaw.
+- **ClawHub skills**: 5 community skills are pre-installed at Docker build time (jina-reader, deep-research-pro, telegram-compose, transcript, task-decomposer). Custom skills (s3-user-files, eventbridge-cron) are in `/skills/` loaded via `extraDirs`. ClawHub installs to the managed skills path, scanned automatically by OpenClaw.
 - **ClawHub `--force` flag**: Some skills are flagged by VirusTotal for external API calls. Use `--no-input --force` for non-interactive Docker builds.
 - **`default-user` fallback**: If identity resolution fails, requests fall back to `actorId = "default-user"` — meaning all such users share one S3 namespace. The `USER_ID` env var path (set by contract server) should prevent this in per-user mode.
 - **actorId vs namespace format**: The actorId uses colon format (`telegram:6087229962`) while skill scripts expect namespace/underscore format (`telegram_6087229962`). The lightweight agent's `chat()` function converts via `userId.replace(/:/g, "_")` before passing to tool scripts. The proxy and workspace sync also use namespace format for S3 keys.
