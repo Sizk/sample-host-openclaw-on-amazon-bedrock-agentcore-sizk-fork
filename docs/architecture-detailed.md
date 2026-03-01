@@ -108,7 +108,8 @@ sequenceDiagram
     end
 
     AC-->>RL: Final response
-    RL->>C: Send message
+    Note over RL: Unwrap nested content blocks<br/>Convert markdown → Telegram HTML
+    RL->>C: Send message (HTML formatted)
     C->>U: Display response
 ```
 

@@ -246,6 +246,7 @@ openclaw-on-agentcore/
     lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 70 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
+    content-extraction.test.js    # Content block extraction tests (node:test)
     subagent-routing.test.js      # Subagent model routing + detection tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
@@ -255,9 +256,11 @@ openclaw-on-agentcore/
       eventbridge-cron/           # Cron scheduling skill (EventBridge Scheduler)
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
-    router/index.py               # Webhook router (Telegram + Slack, image uploads)
-    router/test_image_upload.py   # Image upload unit tests (pytest)
-    cron/index.py                 # Cron executor (warmup, invoke, deliver)
+    router/index.py                    # Webhook router (Telegram + Slack, image uploads)
+    router/test_image_upload.py        # Image upload unit tests (pytest)
+    router/test_content_extraction.py  # Content block extraction tests (pytest)
+    router/test_markdown_html.py       # Markdown-to-HTML conversion tests (pytest)
+    cron/index.py                      # Cron executor (warmup, invoke, deliver)
   scripts/
     setup-telegram.sh             # Telegram webhook + admin allowlist (one-step)
     setup-slack.sh                # Slack Event Subscriptions + admin allowlist
@@ -526,7 +529,7 @@ Each user's schedules are isolated — no cross-user access. Schedule metadata i
 4. Lambda calls `InvokeAgentRuntime` with per-user session ID
 5. Contract server triggers lazy init (first message) or bridges to OpenClaw directly
 6. Proxy converts to Bedrock ConverseStream API call (multimodal if images present)
-7. Response streams back → Lambda sends to channel API
+7. Response streams back → Lambda recursively unwraps nested content blocks (from subagent responses), converts markdown to Telegram HTML, sends to channel API
 
 ### Tools & Skills
 
@@ -611,8 +614,11 @@ cd bridge && node --test proxy-identity.test.js       # identity + workspace tes
 cd bridge && node --test image-support.test.js         # image upload + multimodal tests
 cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
 cd bridge && node --test subagent-routing.test.js      # subagent model routing + detection tests
+cd bridge && node --test content-extraction.test.js    # recursive content block extraction tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
-cd lambda/router && python -m pytest test_image_upload.py -v   # image upload unit tests
+cd lambda/router && python -m pytest test_image_upload.py -v        # image upload unit tests
+cd lambda/router && python -m pytest test_content_extraction.py -v  # content block extraction tests
+cd lambda/router && python -m pytest test_markdown_html.py -v       # markdown-to-HTML conversion tests
 
 # E2E tests (requires deployed stack + E2E_TELEGRAM_CHAT_ID/E2E_TELEGRAM_USER_ID env vars)
 pytest tests/e2e/bot_test.py -v -k smoke               # connectivity + webhook auth

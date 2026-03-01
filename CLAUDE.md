@@ -116,6 +116,7 @@ openclaw-on-agentcore/
     lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 70 tests)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
+    content-extraction.test.js    # Content block extraction tests (node:test)
     workspace-sync.js             # .openclaw/ directory S3 sync (restore/save/periodic)
     force-ipv4.js                 # DNS patch for Node.js 22 IPv6 issue
     skills/
@@ -132,8 +133,10 @@ openclaw-on-agentcore/
   lambda/
     token_metrics/index.py        # Bedrock log -> DynamoDB + CloudWatch metrics
     router/index.py               # Webhook router (Telegram + Slack, image uploads)
-    router/test_image_upload.py   # Image upload unit tests (pytest)
-    cron/index.py                 # Cron executor (warmup, invoke, deliver to channel)
+    router/test_image_upload.py        # Image upload unit tests (pytest)
+    router/test_content_extraction.py  # Content block extraction tests (pytest)
+    router/test_markdown_html.py       # Markdown-to-HTML conversion tests (pytest)
+    cron/index.py                      # Cron executor (warmup, invoke, deliver to channel)
   scripts/
     setup-telegram.sh             # Telegram webhook + admin allowlist (one-step)
     setup-slack.sh                # Slack Event Subscriptions + admin allowlist
@@ -251,12 +254,15 @@ cd bridge && node --test proxy-identity.test.js       # identity + workspace tes
 cd bridge && node --test image-support.test.js         # image upload + multimodal tests
 cd bridge && node --test lightweight-agent.test.js     # lightweight agent tools + buildToolArgs tests
 cd bridge && node --test subagent-routing.test.js      # subagent model routing + detection tests
+cd bridge && node --test content-extraction.test.js    # recursive content block extraction tests
 cd bridge/skills/s3-user-files && AWS_REGION=$CDK_DEFAULT_REGION node --test common.test.js  # S3 skill tests
 ```
 
 ### Router Lambda Tests
 ```bash
-cd lambda/router && python -m pytest test_image_upload.py -v   # image upload unit tests
+cd lambda/router && python -m pytest test_image_upload.py -v        # image upload unit tests
+cd lambda/router && python -m pytest test_content_extraction.py -v  # content block extraction tests
+cd lambda/router && python -m pytest test_markdown_html.py -v       # markdown-to-HTML conversion tests
 ```
 
 ### E2E Tests
@@ -444,6 +450,8 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Slack**: Handles `url_verification` challenge synchronously; ignores retries via `x-slack-retry-num` header
 - **Cold start latency**: First message to a new user triggers microVM creation; lightweight agent responds in ~10-15s while OpenClaw starts in background (~2-4 min)
 - **Typing indicator + progress message**: Telegram typing indicator sent every 4s while waiting; after 30s of waiting, a one-time progress message ("Working on your request...") is sent to both Telegram and Slack so users know the bot is still working during long subagent tasks
+- **Content block extraction**: `_extract_text_from_content_blocks()` recursively unwraps nested `[{"type":"text","text":"..."}]` JSON — subagent responses (deep-research-pro, task-decomposer) can wrap content multiple levels deep
+- **Markdown-to-HTML conversion**: `_markdown_to_telegram_html()` converts markdown to Telegram-compatible HTML before sending. Handles bold, italic, strikethrough, code blocks, inline code, headers, links, blockquotes, horizontal rules, and markdown tables (rendered as monospace `<pre>` blocks with aligned columns). Uses `parse_mode: "HTML"` (not `"Markdown"` v1 which is too strict for AI-generated content)
 - **Cross-channel binding**: "link accounts" generates 6-char code in DynamoDB with 10-min TTL
 - **Image uploads**: Telegram photos and Slack file attachments (JPEG, PNG, GIF, WebP, max 3.75 MB) are downloaded by the Router Lambda, uploaded to S3 under `{namespace}/_uploads/`, and passed to AgentCore as a structured message `{text, images[{s3Key, contentType}]}`
 - **Telegram captions**: `message.get("text", "") or message.get("caption", "")` — photos use `caption`, not `text`
