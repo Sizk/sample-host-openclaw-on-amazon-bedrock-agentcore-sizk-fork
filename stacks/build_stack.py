@@ -178,6 +178,35 @@ class BuildStack(Stack):
                     applies_to=["Resource::*"],
                 ),
                 cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="S3 wildcard permissions required for CodeBuild to access source bucket "
+                    "and write build artifacts. Resource-level permissions not supported for "
+                    "CodeBuild S3 operations.",
+                    applies_to=[
+                        "Action::s3:GetBucket*",
+                        "Action::s3:GetObject*",
+                        "Action::s3:List*",
+                    ],
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="CloudWatch Logs wildcard permissions required for CodeBuild to write "
+                    "build logs. Resource-level permissions not supported for CodeBuild "
+                    "CloudWatch operations.",
+                    applies_to=[
+                        "Resource::arn:aws:logs:eu-west-1:279826012703:log-group:/aws/codebuild/<BridgeBuildProject483AAFF2>:*",
+                    ],
+                ),
+                cdk_nag.NagPackSuppression(
+                    id="AwsSolutions-IAM5",
+                    reason="CodeBuild report group wildcard permissions required for CodeBuild to "
+                    "generate build reports. Resource-level permissions not supported for "
+                    "CodeBuild report group operations.",
+                    applies_to=[
+                        "Resource::arn:aws:codebuild:eu-west-1:279826012703:report-group/<BridgeBuildProject483AAFF2>-*",
+                    ],
+                ),
+                cdk_nag.NagPackSuppression(
                     id="AwsSolutions-CB3",
                     reason="Privileged mode is required to run the Docker daemon "
                     "inside CodeBuild for building container images.",

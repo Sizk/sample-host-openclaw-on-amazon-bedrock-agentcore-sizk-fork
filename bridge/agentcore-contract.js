@@ -326,6 +326,7 @@ function writeOpenClawConfig() {
         enabled: false,
         allowInsecureAuth: true,
         dangerouslyDisableDeviceAuth: true,
+        dangerouslyAllowHostHeaderOriginFallback: true,
       },
     },
     channels: {}, // No channels — messages bridged via WebSocket

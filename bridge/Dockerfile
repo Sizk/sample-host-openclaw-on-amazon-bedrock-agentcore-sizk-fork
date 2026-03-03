@@ -14,14 +14,14 @@ RUN pip3 install --no-cache-dir --break-system-packages awscli
 # Install OpenClaw and ClawHub CLI globally
 RUN npm install -g openclaw@latest clawhub@latest
 
-# ClawHub community skills skipped — clawhub.io SSL certificate expired.
-# Re-enable once ClawHub fixes their cert:
-#   RUN clawhub install jina-reader --no-input --force && \
-#       clawhub install deep-research-pro --no-input --force && \
-#       clawhub install telegram-compose --no-input --force && \
-#       clawhub install transcript --no-input --force && \
-#       clawhub install task-decomposer --no-input --force
-RUN mkdir -p /skills/
+# Install ClawHub community skills.
+# NODE_TLS_REJECT_UNAUTHORIZED=0 bypasses clawhub.io expired SSL cert at build time.
+# --no-input --force: non-interactive, skip VirusTotal warnings.
+RUN NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install jina-reader --no-input --force && \
+    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install deep-research-pro --no-input --force && \
+    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install telegram-compose --no-input --force && \
+    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install transcript --no-input --force && \
+    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install task-decomposer --no-input --force
 
 # Create app directory
 RUN mkdir -p /app
