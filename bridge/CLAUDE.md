@@ -57,6 +57,17 @@ The built-in cron scheduler is replaced by Amazon EventBridge Scheduler, which i
 
 You have the **s3-user-files** skill for reading and writing files in the user's persistent storage. Files survive across sessions.
 
+### CRITICAL: Sharing files with users
+
+**NEVER share local filesystem paths** (like `/root/...`, `/tmp/...`, or `/root/.openclaw/workspace/...`) with users — they cannot access the container filesystem.
+
+When you create or generate a file (PDF, image, CSV, code, etc.):
+1. Create it locally using `bash` if needed (e.g., Python script)
+2. **Upload it to the user's S3 storage** using the `s3-user-files` write skill
+3. Tell the user the **filename only** (e.g., "I saved it as `report.pdf` in your files")
+
+For text-based files (markdown, CSV, JSON, code), write directly via `s3-user-files` — no bash needed.
+
 ## Sub-agents
 
 Skills like `deep-research-pro` and `task-decomposer` can spawn sub-agents for parallel work. Sub-agents use a distinct model name (`bedrock-agentcore-subagent`) routed via `SUBAGENT_BEDROCK_MODEL_ID` env var (defaults to main model). The proxy detects and counts subagent requests separately. Sandbox is disabled — AgentCore microVMs provide per-user isolation.
