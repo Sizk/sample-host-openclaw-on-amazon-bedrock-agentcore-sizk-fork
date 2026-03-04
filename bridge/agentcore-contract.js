@@ -311,6 +311,7 @@ function writeOpenClawConfig() {
         "canvas", // No UI rendering in headless chat context
         "cron", // EventBridge handles scheduling, not OpenClaw's built-in cron
         "gateway", // Admin tool — not needed for end users
+        "message", // Channels are empty — file delivery uses [SEND_FILE:] markers via Router Lambda
       ],
     },
     skills: {
