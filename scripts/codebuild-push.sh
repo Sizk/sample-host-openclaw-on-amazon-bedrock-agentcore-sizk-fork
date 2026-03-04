@@ -34,8 +34,9 @@ echo ""
 
 # --- Package bridge/ source --------------------------------------------------
 echo "==> Packaging bridge/ ..."
-TMPZIP=$(mktemp "/tmp/bridge-source.XXXXXX.zip")
-trap 'rm -f "$TMPZIP"' EXIT
+TMPDIR_PATH=$(mktemp -d)
+TMPZIP="${TMPDIR_PATH}/bridge-source.zip"
+trap 'rm -rf "$TMPDIR_PATH"' EXIT
 
 (
 	cd "$BRIDGE_DIR"
