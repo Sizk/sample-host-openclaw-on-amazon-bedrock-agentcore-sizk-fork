@@ -1,7 +1,7 @@
 # ============================================================
 # Stage 1: Builder — install all dependencies and tools
 # ============================================================
-FROM --platform=linux/arm64 node:22-slim AS builder
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim AS builder
 
 # Install system dependencies
 RUN apt-get update && \
@@ -60,7 +60,7 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 # Stage 2: Runtime — minimal image with only needed artifacts
 # ============================================================
-FROM --platform=linux/arm64 node:22-slim
+FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim
 
 # Install only runtime system dependencies (no git, no pip, no build tools)
 RUN apt-get update && \
