@@ -383,14 +383,17 @@ function writeOpenClawConfig() {
         "",
         "When you create or generate a file (PDF, image, CSV, etc.):",
         "1. Create it locally using bash (e.g., Python script, Node.js, etc.)",
-        "2. **Read the file content** and **write it to S3** using the `s3-user-files` skill",
-        "3. Tell the user the **filename only** (e.g., `ejemplo.pdf`) — they can retrieve it later by asking you",
+        "2. **Upload it to S3** using s3-user-files: `write_user_file` with `--file=/tmp/report.pdf`",
+        "3. **Send it to the user** by including `[SEND_FILE:report.pdf]` in your response text",
+        "",
+        "The `[SEND_FILE:filename]` marker tells the system to fetch the file from S3 and deliver it",
+        "as a native file attachment in Telegram/Slack. The marker is stripped from the visible message.",
         "",
         "Example workflow for generating a PDF:",
         "```",
         "1. bash: python3 -c '...' > /tmp/report.pdf",
-        "2. s3-user-files write: upload /tmp/report.pdf as 'report.pdf'",
-        "3. Tell user: 'I created report.pdf and saved it to your files.'",
+        "2. s3-user-files write: node write.js <user_id> report.pdf --file=/tmp/report.pdf",
+        "3. Response: 'Here is your report! [SEND_FILE:report.pdf]'",
         "```",
         "",
         "For text-based files (markdown, CSV, JSON), you can write directly via s3-user-files without bash.",
@@ -956,6 +959,42 @@ async function bridgeMessage(message, timeoutMs = 560000) {
  * Build bridge text from message payload.
  * Handles structured messages with images and plain text.
  */
+/**
+ * Extract [SEND_FILE:filename] markers from response text.
+ * Returns { files: [{s3Key, filename, contentType}], cleanText: strippedText }.
+ */
+function extractFileMarkers(responseText, namespace) {
+  const MARKER_RE = /\[SEND_FILE:([^\]]+)\]/g;
+  const files = [];
+  let match;
+  while ((match = MARKER_RE.exec(responseText)) !== null) {
+    const filename = match[1].trim();
+    if (!filename) continue;
+    // Sanitize same as skills/s3-user-files/common.js sanitize()
+    const sanitize = (s) => {
+      let r = s;
+      while (r.includes("..")) r = r.replace(/\.\./g, "");
+      return r.replace(/[^a-zA-Z0-9_\-.]/g, "_").slice(0, 256);
+    };
+    const ext = (filename.split(".").pop() || "").toLowerCase();
+    const CONTENT_TYPES = {
+      pdf: "application/pdf",
+      jpg: "image/jpeg", jpeg: "image/jpeg",
+      png: "image/png", gif: "image/gif", webp: "image/webp",
+      csv: "text/csv", json: "application/json",
+      txt: "text/plain", md: "text/markdown",
+      html: "text/html", xml: "application/xml", zip: "application/zip",
+    };
+    files.push({
+      s3Key: `${sanitize(namespace)}/${sanitize(filename)}`,
+      filename,
+      contentType: CONTENT_TYPES[ext] || "application/octet-stream",
+    });
+  }
+  const cleanText = responseText.replace(MARKER_RE, "").trim();
+  return { files, cleanText };
+}
+
 function buildBridgeText(message) {
   if (
     typeof message === "object" &&
@@ -1126,12 +1165,16 @@ const server = http.createServer(async (req, res) => {
             }
           }
 
+          // Extract [SEND_FILE:filename] markers and strip them from visible text
+          const { files: cronFiles, cleanText: cronCleanText } = extractFileMarkers(responseText, currentNamespace);
+
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
-              response: responseText,
+              response: cronCleanText,
               userId: currentUserId,
               sessionId: payload.sessionId || null,
+              ...(cronFiles.length > 0 ? { files: cronFiles } : {}),
             }),
           );
           return;
@@ -1234,12 +1277,16 @@ const server = http.createServer(async (req, res) => {
             responseText = "I'm starting up — please try again in a moment.";
           }
 
+          // Extract [SEND_FILE:filename] markers and strip them from visible text
+          const { files, cleanText } = extractFileMarkers(responseText, currentNamespace);
+
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(
             JSON.stringify({
-              response: responseText,
+              response: cleanText,
               userId: currentUserId,
               sessionId: payload.sessionId || null,
+              ...(files.length > 0 ? { files } : {}),
             }),
           );
           return;

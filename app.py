@@ -81,6 +81,8 @@ cron_stack = CronStack(
     telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
     slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
     cmk_arn=security_stack.cmk.key_arn,
+    user_files_bucket_name=agentcore_stack.user_files_bucket.bucket_name,
+    user_files_bucket_arn=agentcore_stack.user_files_bucket.bucket_arn,
     agentcore_execution_role=agentcore_stack.execution_role,
     env=env,
 )

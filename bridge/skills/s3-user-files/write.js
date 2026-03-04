@@ -1,8 +1,5 @@
 #!/usr/bin/env node
-/**
- * write_user_file — Write content to a user's S3-namespaced file.
- * Usage: node write.js <user_id> <filename> <content...>
- */
+const fs = require('fs');
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 const {
   BUCKET,
@@ -12,15 +9,33 @@ const {
   validateBucket,
 } = require("./common");
 
-/**
- * Read all data from stdin as a string.
- */
+const MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+
+function getContentType(filename) {
+  const ext = (filename.split(".").pop() || "").toLowerCase();
+  const types = {
+    pdf: "application/pdf",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    png: "image/png",
+    gif: "image/gif",
+    webp: "image/webp",
+    csv: "text/csv",
+    json: "application/json",
+    txt: "text/plain",
+    md: "text/markdown",
+    html: "text/html",
+    xml: "application/xml",
+    zip: "application/zip",
+  };
+  return types[ext] || "application/octet-stream";
+}
+
 function readStdin() {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    process.stdin.setEncoding("utf-8");
     process.stdin.on("data", (chunk) => chunks.push(chunk));
-    process.stdin.on("end", () => resolve(chunks.join("")));
+    process.stdin.on("end", () => resolve(Buffer.concat(chunks)));
     process.stdin.on("error", reject);
   });
 }
@@ -28,9 +43,7 @@ function readStdin() {
 async function main() {
   const userId = process.argv[2];
   const filename = process.argv[3];
-  // Read content from argv or stdin (--stdin flag). Stdin avoids OS ARG_MAX limits.
   const argContent = process.argv.slice(4).join(" ");
-  const content = argContent === "--stdin" ? await readStdin() : argContent;
 
   validateUserId(userId);
   validateBucket();
@@ -39,14 +52,30 @@ async function main() {
     console.error("Error: filename argument is required.");
     process.exit(1);
   }
-  if (!content) {
-    console.error("Error: content argument is required.");
+
+  let body;
+
+  if (argContent === "--stdin") {
+    body = await readStdin();
+  } else if (argContent.startsWith("--file=")) {
+    const filePath = argContent.slice(7);
+    if (!fs.existsSync(filePath)) {
+      console.error(`Error: file not found: ${filePath}`);
+      process.exit(1);
+    }
+    body = fs.readFileSync(filePath);
+  } else {
+    body = argContent;
+  }
+
+  if (!body || (Buffer.isBuffer(body) && body.length === 0) || body === "") {
+    console.error("Error: content is empty.");
     process.exit(1);
   }
 
-  const MAX_CONTENT_BYTES = 1 * 1024 * 1024; // 1 MB
-  if (Buffer.byteLength(content, "utf-8") > MAX_CONTENT_BYTES) {
-    console.error("Error: content exceeds maximum allowed size (1 MB).");
+  const size = Buffer.isBuffer(body) ? body.length : Buffer.byteLength(body, "utf-8");
+  if (size > MAX_BYTES) {
+    console.error(`Error: content exceeds maximum allowed size (${MAX_BYTES / 1024 / 1024} MB).`);
     process.exit(1);
   }
 
@@ -57,12 +86,12 @@ async function main() {
     new PutObjectCommand({
       Bucket: BUCKET,
       Key: key,
-      Body: content,
-      ContentType: "text/plain; charset=utf-8",
+      Body: body,
+      ContentType: getContentType(filename),
     }),
   );
 
-  console.log(`File written: ${key} (${content.length} bytes)`);
+  console.log(`File written: ${key} (${size} bytes)`);
 }
 
 main().catch((err) => {

@@ -37,6 +37,8 @@ class CronStack(Stack):
         telegram_token_secret_name: str,
         slack_token_secret_name: str,
         cmk_arn: str,
+        user_files_bucket_name: str,
+        user_files_bucket_arn: str,
         agentcore_execution_role: iam.IRole,
         **kwargs,
     ) -> None:
@@ -90,6 +92,7 @@ class CronStack(Stack):
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
                 "LAMBDA_TIMEOUT_SECONDS": str(lambda_timeout),
+                "USER_FILES_BUCKET": user_files_bucket_name,
             },
             log_group=cron_log_group,
         )
@@ -149,6 +152,14 @@ class CronStack(Stack):
             iam.PolicyStatement(
                 actions=["kms:Decrypt"],
                 resources=[cmk_arn],
+            )
+        )
+
+        # S3 read for file attachments
+        self.cron_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject"],
+                resources=[f"{user_files_bucket_arn}/*"],
             )
         )
 
@@ -230,11 +241,13 @@ class CronStack(Stack):
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
                     "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
-                    "index wildcard needed for query operations.",
+                    "index wildcard needed for query operations. S3 GetObject "
+                    "scoped to user-files bucket for file attachments.",
                     applies_to=[
                         f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:runtime/<AgentRuntime.AgentRuntimeId>/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::arn:aws:dynamodb:{region}:{account}:table/{identity_table_name}/index/*",
+                        "Resource::<UserFilesBucketCFDFD8C0.Arn>/*",
                     ],
                 ),
                 cdk_nag.NagPackSuppression(

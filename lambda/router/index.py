@@ -699,6 +699,129 @@ def send_slack_message(channel_id, text, bot_token):
         logger.error("Failed to send Slack message to %s: %s", channel_id, e)
 
 
+def _download_file_from_s3(s3_key):
+    """Download a file from the user-files S3 bucket. Returns bytes or None."""
+    if not USER_FILES_BUCKET:
+        logger.warning("USER_FILES_BUCKET not configured — cannot download file")
+        return None
+    try:
+        resp = s3_client.get_object(Bucket=USER_FILES_BUCKET, Key=s3_key)
+        return resp["Body"].read()
+    except Exception as e:
+        logger.error("S3 file download failed for %s: %s", s3_key, e)
+        return None
+
+
+def send_telegram_document(chat_id, file_bytes, filename, token, caption=None):
+    """Send a file as a native document attachment via Telegram Bot API (multipart)."""
+    if not token:
+        logger.error("No Telegram token available")
+        return
+    import io
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    boundary = uuid.uuid4().hex
+    body_parts = []
+    # chat_id field
+    body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n{chat_id}")
+    # caption field (optional)
+    if caption:
+        body_parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\n{caption[:1024]}")
+    # document field (binary)
+    body_parts.append(
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{filename}\"\r\n"
+        f"Content-Type: application/octet-stream\r\n\r\n"
+    )
+    # Build multipart body
+    payload = b""
+    for part in body_parts[:-1]:
+        payload += part.encode() + b"\r\n"
+    # Last text part (before binary) + binary data + closing boundary
+    payload += body_parts[-1].encode()
+    payload += file_bytes
+    payload += f"\r\n--{boundary}--\r\n".encode()
+
+    req = urllib_request.Request(
+        url, data=payload,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        urllib_request.urlopen(req, timeout=30)
+        logger.info("Telegram document sent: %s (%d bytes)", filename, len(file_bytes))
+    except Exception as e:
+        logger.error("Failed to send Telegram document %s: %s", filename, e)
+
+
+def send_slack_file(channel_id, file_bytes, filename, bot_token, comment=None):
+    """Upload a file to Slack via files.uploadV2 (two-step: getUploadURLExternal + completeUploadExternal)."""
+    if not bot_token:
+        logger.error("No Slack bot token available")
+        return
+    headers_auth = {
+        "Authorization": f"Bearer {bot_token}",
+    }
+    # Step 1: get upload URL
+    step1_url = f"https://slack.com/api/files.getUploadURLExternal?filename={quote(filename)}&length={len(file_bytes)}"
+    req1 = urllib_request.Request(step1_url, headers=headers_auth)
+    try:
+        resp1 = urllib_request.urlopen(req1, timeout=10)
+        step1_data = json.loads(resp1.read().decode())
+    except Exception as e:
+        logger.error("Slack getUploadURLExternal failed: %s", e)
+        return
+    if not step1_data.get("ok"):
+        logger.error("Slack getUploadURLExternal error: %s", step1_data.get("error"))
+        return
+    upload_url = step1_data["upload_url"]
+    file_id = step1_data["file_id"]
+
+    # Step 2: upload file bytes to the URL
+    req2 = urllib_request.Request(upload_url, data=file_bytes, method="POST")
+    req2.add_header("Content-Type", "application/octet-stream")
+    try:
+        urllib_request.urlopen(req2, timeout=30)
+    except Exception as e:
+        logger.error("Slack file upload failed: %s", e)
+        return
+
+    # Step 3: complete the upload and share to channel
+    complete_data = json.dumps({
+        "files": [{"id": file_id, "title": filename}],
+        "channel_id": channel_id,
+        **({"initial_comment": comment} if comment else {}),
+    }).encode()
+    req3 = urllib_request.Request(
+        "https://slack.com/api/files.completeUploadExternal",
+        data=complete_data,
+        headers={"Content-Type": "application/json", **headers_auth},
+    )
+    try:
+        resp3 = urllib_request.urlopen(req3, timeout=10)
+        step3_data = json.loads(resp3.read().decode())
+        if not step3_data.get("ok"):
+            logger.error("Slack completeUploadExternal error: %s", step3_data.get("error"))
+        else:
+            logger.info("Slack file sent: %s (%d bytes)", filename, len(file_bytes))
+    except Exception as e:
+        logger.error("Slack completeUploadExternal failed: %s", e)
+
+
+def _send_response_files(files, channel_type, chat_id, token_or_bot_token):
+    """Download files from S3 and send as native attachments to the channel."""
+    if not files:
+        return
+    for f in files:
+        s3_key = f.get("s3Key")
+        filename = f.get("filename", s3_key.rsplit("/", 1)[-1] if s3_key else "file")
+        file_bytes = _download_file_from_s3(s3_key)
+        if not file_bytes:
+            logger.warning("Skipping file %s — could not download from S3", s3_key)
+            continue
+        if channel_type == "telegram":
+            send_telegram_document(chat_id, file_bytes, filename, token_or_bot_token)
+        elif channel_type == "slack":
+            send_slack_file(chat_id, file_bytes, filename, token_or_bot_token)
+
+
 def _slack_progress_notify(channel_id, bot_token, stop_event, notify_after_s=30):
     """Send a one-time progress message to Slack if the request takes longer than notify_after_s."""
     if not stop_event.wait(timeout=notify_after_s):
@@ -986,6 +1109,10 @@ def handle_telegram(body):
     else:
         for i in range(0, len(response_text), 4096):
             send_telegram_message(chat_id, response_text[i:i + 4096], token)
+
+    # Send file attachments if present
+    _send_response_files(result.get("files"), "telegram", chat_id, token)
+
     logger.info("Telegram response sent to chat_id=%s", chat_id)
 
 
@@ -1107,6 +1234,10 @@ def handle_slack(body, headers=None):
     response_text = _extract_text_from_content_blocks(response_text)
 
     send_slack_message(channel_id, response_text, bot_token)
+
+    # Send file attachments if present
+    _send_response_files(result.get("files"), "slack", channel_id, bot_token)
+
     return {"statusCode": 200, "body": "ok"}
 
 

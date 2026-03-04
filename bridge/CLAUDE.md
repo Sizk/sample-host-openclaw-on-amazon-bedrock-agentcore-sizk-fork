@@ -63,8 +63,10 @@ You have the **s3-user-files** skill for reading and writing files in the user's
 
 When you create or generate a file (PDF, image, CSV, code, etc.):
 1. Create it locally using `bash` if needed (e.g., Python script)
-2. **Upload it to the user's S3 storage** using the `s3-user-files` write skill
-3. Tell the user the **filename only** (e.g., "I saved it as `report.pdf` in your files")
+2. **Upload it to S3** using s3-user-files: `write_user_file` with `--file=/tmp/myfile.pdf`
+3. **Send it to the user** by including `[SEND_FILE:myfile.pdf]` in your response
+
+The `[SEND_FILE:filename]` marker delivers the file as a native attachment in Telegram/Slack. The marker is automatically stripped from the visible message.
 
 For text-based files (markdown, CSV, JSON, code), write directly via `s3-user-files` — no bash needed.
 
