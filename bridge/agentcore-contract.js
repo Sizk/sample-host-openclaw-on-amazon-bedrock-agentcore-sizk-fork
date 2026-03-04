@@ -341,80 +341,103 @@ function writeOpenClawConfig() {
   );
   console.log("[contract] OpenClaw headless config written");
 
-  // Write AGENTS.md — OpenClaw loads this as workspace bootstrap instructions.
-  // Always overwrite to ensure latest instructions (excluded from workspace sync via SKIP_PATTERNS).
-  const agentsMdPath = `${homeDir}/.openclaw/AGENTS.md`;
-  {
-    fs.writeFileSync(
-      agentsMdPath,
-      [
-        "# Agent Instructions",
-        "",
-        "You are a helpful AI assistant running in a per-user container on AWS.",
-        "You have built-in web tools, file storage, scheduling, and many community skills.",
-        "",
-        "## Built-in Web Tools",
-        "",
-        "You have built-in **web_search** and **web_fetch** tools:",
-        "- **web_search**: Search the web for current information",
-        "- **web_fetch**: Fetch and read web page content as markdown",
-        "",
-        "Use these for real-time information, news, research, and reading web pages.",
-        "",
-        "## Scheduling & Cron Jobs",
-        "",
-        "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to:",
-        "- Set up reminders, alarms, or scheduled messages",
-        "- Create recurring tasks or cron jobs",
-        "- Schedule daily, weekly, or periodic actions",
-        "",
-        "**Read the eventbridge-cron SKILL.md and use it.** Do NOT say cron is disabled.",
-        "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
-        "",
-        "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
-        "",
-        "## File Storage",
-        "",
-        "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
-        "",
-        "### CRITICAL: Sharing files with users",
-        "",
-        "**NEVER share local filesystem paths** (like `/root/...` or `/tmp/...`) with users — they are meaningless outside the container.",
-        "",
-        "When you create or generate a file (PDF, image, CSV, etc.):",
-        "1. Create it locally using bash (e.g., Python script, Node.js, etc.)",
-        "2. **Upload it to S3** using s3-user-files: `write_user_file` with `--file=/tmp/report.pdf`",
-        "3. **Send it to the user** by including `[SEND_FILE:report.pdf]` in your response text",
-        "",
-        "The `[SEND_FILE:filename]` marker tells the system to fetch the file from S3 and deliver it",
-        "as a native file attachment in Telegram/Slack. The marker is stripped from the visible message.",
-        "",
-        "Example workflow for generating a PDF:",
-        "```",
-        "1. bash: python3 -c '...' > /tmp/report.pdf",
-        "2. s3-user-files write: node write.js <user_id> report.pdf --file=/tmp/report.pdf",
-        "3. Response: 'Here is your report! [SEND_FILE:report.pdf]'",
-        "```",
-        "",
-        "For text-based files (markdown, CSV, JSON), you can write directly via s3-user-files without bash.",
-        "",
-        "## Community Skills (ClawHub)",
-        "",
-        "The following community skills are pre-installed:",
-        "- **jina-reader**: Extract web content as clean markdown (higher quality than built-in web_fetch)",
-        "- **deep-research-pro**: In-depth multi-step research on complex topics (uses sub-agents)",
-        "- **telegram-compose**: Rich HTML formatting for Telegram messages",
-        "- **transcript**: YouTube video transcript extraction",
-        "- **task-decomposer**: Break complex requests into manageable subtasks (uses sub-agents)",
-        "",
-        "## Sub-agents",
-        "",
-        "Skills like deep-research-pro and task-decomposer can spawn sub-agents for parallel work.",
-        "Sub-agents share the same model and capabilities. Sandbox is disabled (the container is already isolated).",
-        "",
-      ].join("\n"),
+}
+
+// AGENTS.md content — canonical operating instructions for the AI agent.
+// Written to S3 at {namespace}/AGENTS.md on every init so the proxy's system
+// prompt injection always has the latest instructions.
+const AGENTS_MD_CONTENT = [
+  "# Agent Instructions",
+  "",
+  "You are a helpful AI assistant running in a per-user container on AWS.",
+  "You have built-in web tools, file storage, scheduling, and many community skills.",
+  "",
+  "## Built-in Web Tools",
+  "",
+  "You have built-in **web_search** and **web_fetch** tools:",
+  "- **web_search**: Search the web for current information",
+  "- **web_fetch**: Fetch and read web page content as markdown",
+  "",
+  "Use these for real-time information, news, research, and reading web pages.",
+  "",
+  "## Scheduling & Cron Jobs",
+  "",
+  "You have the **eventbridge-cron** skill for scheduling tasks. When users ask to:",
+  "- Set up reminders, alarms, or scheduled messages",
+  "- Create recurring tasks or cron jobs",
+  "- Schedule daily, weekly, or periodic actions",
+  "",
+  "**Read the eventbridge-cron SKILL.md and use it.** Do NOT say cron is disabled.",
+  "The built-in cron is replaced by Amazon EventBridge Scheduler (more reliable, persists across sessions).",
+  "",
+  "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
+  "",
+  "## File Storage",
+  "",
+  "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
+  "",
+  "### CRITICAL: Sharing files with users",
+  "",
+  "**NEVER share local filesystem paths** (like `/root/...` or `/tmp/...`) with users — they are meaningless outside the container.",
+  "",
+  "When you create or generate a file (PDF, image, CSV, etc.):",
+  "1. Create it locally using bash (e.g., Python script, Node.js, etc.)",
+  "2. **Upload it to S3** using s3-user-files: `write_user_file` with `--file=/tmp/report.pdf`",
+  "3. **Send it to the user** by including `[SEND_FILE:report.pdf]` in your response text",
+  "",
+  "The `[SEND_FILE:filename]` marker tells the system to fetch the file from S3 and deliver it",
+  "as a native file attachment in Telegram/Slack. The marker is stripped from the visible message.",
+  "",
+  "Example workflow for generating a PDF:",
+  "```",
+  "1. bash: python3 -c '...' > /tmp/report.pdf",
+  "2. s3-user-files write: node write.js <user_id> report.pdf --file=/tmp/report.pdf",
+  "3. Response: 'Here is your report! [SEND_FILE:report.pdf]'",
+  "```",
+  "",
+  "For text-based files (markdown, CSV, JSON), you can write directly via s3-user-files without bash.",
+  "",
+  "## Community Skills (ClawHub)",
+  "",
+  "The following community skills are pre-installed:",
+  "- **jina-reader**: Extract web content as clean markdown (higher quality than built-in web_fetch)",
+  "- **deep-research-pro**: In-depth multi-step research on complex topics (uses sub-agents)",
+  "- **telegram-compose**: Rich HTML formatting for Telegram messages",
+  "- **transcript**: YouTube video transcript extraction",
+  "- **task-decomposer**: Break complex requests into manageable subtasks (uses sub-agents)",
+  "",
+  "## Sub-agents",
+  "",
+  "Skills like deep-research-pro and task-decomposer can spawn sub-agents for parallel work.",
+  "Sub-agents share the same model and capabilities. Sandbox is disabled (the container is already isolated).",
+  "",
+].join("\n");
+
+/**
+ * Write AGENTS.md to S3 at {namespace}/AGENTS.md (top-level).
+ * The proxy reads from this path to inject instructions into the system prompt.
+ * Uses workspace-sync's S3 client which has scoped credentials configured.
+ */
+async function writeAgentsMdToS3(namespace) {
+  const bucket = process.env.S3_USER_FILES_BUCKET;
+  if (!bucket || !namespace) {
+    console.log("[contract] No bucket or namespace — skipping AGENTS.md S3 write");
+    return;
+  }
+  try {
+    const { PutObjectCommand } = require("@aws-sdk/client-s3");
+    const s3 = workspaceSync.getS3Client();
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: `${namespace}/AGENTS.md`,
+        Body: AGENTS_MD_CONTENT,
+        ContentType: "text/markdown; charset=utf-8",
+      }),
     );
-    console.log("[contract] AGENTS.md written");
+    console.log(`[contract] AGENTS.md written to s3://${bucket}/${namespace}/AGENTS.md`);
+  } catch (err) {
+    console.warn(`[contract] Failed to write AGENTS.md to S3: ${err.message}`);
   }
 }
 
@@ -593,6 +616,13 @@ async function init(userId, actorId, channel) {
     // Restore workspace from S3 (non-blocking, needed for OpenClaw)
     workspaceSync.restoreWorkspace(namespace).catch((err) => {
       console.warn(`[contract] Workspace restore failed: ${err.message}`);
+    });
+
+    // Write AGENTS.md to S3 at {namespace}/AGENTS.md (top-level, where the proxy reads it).
+    // This ensures the proxy's system prompt injection has the full operating instructions
+    // from the very first request. Always overwrite to pick up latest instructions on redeploy.
+    writeAgentsMdToS3(namespace).catch((err) => {
+      console.warn(`[contract] AGENTS.md S3 write failed: ${err.message}`);
     });
 
     // 2. Wait only for proxy readiness (~5s)

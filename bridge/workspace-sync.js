@@ -37,7 +37,6 @@ const SKIP_PATTERNS = [
   ".npm/",
   "package-lock.json",
   "openclaw.json",
-  "AGENTS.md",
 ];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
