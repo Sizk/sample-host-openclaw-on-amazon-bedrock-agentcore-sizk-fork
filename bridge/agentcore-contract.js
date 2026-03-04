@@ -342,9 +342,9 @@ function writeOpenClawConfig() {
   console.log("[contract] OpenClaw headless config written");
 
   // Write AGENTS.md — OpenClaw loads this as workspace bootstrap instructions.
-  // Only write if not already present (workspace restore from S3 may have a user-customized version).
+  // Always overwrite to ensure latest instructions (excluded from workspace sync via SKIP_PATTERNS).
   const agentsMdPath = `${homeDir}/.openclaw/AGENTS.md`;
-  if (!fs.existsSync(agentsMdPath)) {
+  {
     fs.writeFileSync(
       agentsMdPath,
       [
