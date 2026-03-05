@@ -44,6 +44,8 @@ agentcore_stack = AgentCoreStack(
     cognito_user_pool_id=security_stack.user_pool_id,
     cognito_password_secret_name=security_stack.cognito_password_secret.secret_name,
     gateway_token_secret_name=security_stack.gateway_token_secret.secret_name,
+    telegram_token_secret_name=security_stack.channel_secrets["telegram"].secret_name,
+    slack_token_secret_name=security_stack.channel_secrets["slack"].secret_name,
     env=env,
 )
 

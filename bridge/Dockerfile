@@ -105,6 +105,7 @@ RUN mkdir -p /root/.openclaw
 COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
+COPY channel-sender.js /app/channel-sender.js
 COPY workspace-sync.js /app/workspace-sync.js
 COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js

@@ -27,6 +27,7 @@ const {
 const workspaceSync = require("./workspace-sync");
 const agent = require("./lightweight-agent");
 const scopedCreds = require("./scoped-credentials");
+const channelSender = require("./channel-sender");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -39,6 +40,11 @@ let GATEWAY_TOKEN = null;
 // Cognito password secret — fetched from Secrets Manager eagerly at boot.
 // Stored in-process only, never written to process.env.
 let COGNITO_PASSWORD_SECRET = null;
+
+// Channel bot tokens — fetched from Secrets Manager eagerly at boot.
+// Used by channel-sender.js to deliver responses directly from the container.
+let TELEGRAM_BOT_TOKEN = null;
+let SLACK_BOT_TOKEN = null;
 
 // Maximum request body size (1MB) to prevent memory exhaustion
 const MAX_BODY_SIZE = 1 * 1024 * 1024;
@@ -54,6 +60,8 @@ let secretsReady = false;
 let initInProgress = false;
 let initPromise = null;
 let secretsPrefetchPromise = null;
+let currentChannel = null;
+let currentChatId = null;
 let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
@@ -96,6 +104,43 @@ async function prefetchSecrets() {
     if (resp.SecretString) {
       COGNITO_PASSWORD_SECRET = resp.SecretString;
       console.log("[contract] Cognito password secret pre-fetched");
+    }
+  }
+
+  // Fetch channel bot tokens (for async direct response mode)
+  const telegramSecretId = process.env.TELEGRAM_TOKEN_SECRET_ID;
+  if (telegramSecretId) {
+    try {
+      const resp = await smClient.send(
+        new GetSecretValueCommand({ SecretId: telegramSecretId }),
+      );
+      if (resp.SecretString) {
+        TELEGRAM_BOT_TOKEN = resp.SecretString;
+        console.log("[contract] Telegram bot token pre-fetched");
+      }
+    } catch (err) {
+      console.warn(`[contract] Telegram token fetch failed: ${err.message}`);
+    }
+  }
+
+  const slackSecretId = process.env.SLACK_TOKEN_SECRET_ID;
+  if (slackSecretId) {
+    try {
+      const resp = await smClient.send(
+        new GetSecretValueCommand({ SecretId: slackSecretId }),
+      );
+      if (resp.SecretString) {
+        // Slack secret is JSON: {"botToken":"xoxb-...","signingSecret":"..."}
+        try {
+          const data = JSON.parse(resp.SecretString);
+          SLACK_BOT_TOKEN = data.botToken || resp.SecretString;
+        } catch {
+          SLACK_BOT_TOKEN = resp.SecretString;
+        }
+        console.log("[contract] Slack bot token pre-fetched");
+      }
+    } catch (err) {
+      console.warn(`[contract] Slack token fetch failed: ${err.message}`);
     }
   }
 
@@ -727,8 +772,16 @@ function extractTextFromContent(content) {
     // Check if the string is a JSON-serialized array of content blocks
     const trimmed = content.trim();
     if (trimmed.startsWith("[{") && trimmed.endsWith("]")) {
+      // Sanitize control characters (literal newlines, tabs) that are invalid
+      // in JSON strings but may appear in OpenClaw bridge responses.
+      const sanitized = trimmed.replace(/[\x00-\x1f]/g, (ch) => {
+        if (ch === "\n") return "\\n";
+        if (ch === "\r") return "\\r";
+        if (ch === "\t") return "\\t";
+        return "";
+      });
       try {
-        const parsed = JSON.parse(trimmed);
+        const parsed = JSON.parse(sanitized);
         if (
           Array.isArray(parsed) &&
           parsed.length > 0 &&
@@ -1133,6 +1186,117 @@ function buildBridgeText(message) {
 }
 
 /**
+ * Process a message and deliver the response directly to the user's channel.
+ * Used in async mode — runs in the background after returning "accepted".
+ *
+ * Handles typing indicators, routing (OpenClaw vs lightweight agent),
+ * file extraction, and delivery via channel-sender.js.
+ */
+async function processAndDeliver(bridgeText, actorId, channel, chatId) {
+  const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+
+  // Start periodic typing indicator
+  let typingTimer = null;
+  if (channel === "telegram" && TELEGRAM_BOT_TOKEN) {
+    channelSender.sendTelegramTyping(chatId, TELEGRAM_BOT_TOKEN);
+    typingTimer = setInterval(() => {
+      channelSender.sendTelegramTyping(chatId, TELEGRAM_BOT_TOKEN);
+    }, 4000);
+  }
+
+  // One-time progress message after 30s of processing
+  let progressSent = false;
+  const progressTimer = setTimeout(async () => {
+    progressSent = true;
+    const msg =
+      "\u23f3 Working on your request \u2014 this may take a few minutes. " +
+      "I'll send the full response when it's ready.";
+    try {
+      if (channel === "telegram") {
+        await channelSender.sendTelegramMessage(chatId, msg, TELEGRAM_BOT_TOKEN);
+      } else if (channel === "slack") {
+        await channelSender.sendSlackMessage(chatId, msg, SLACK_BOT_TOKEN);
+      }
+    } catch (e) {
+      console.warn(`[contract] Progress message failed: ${e.message}`);
+    }
+  }, 30000);
+
+  try {
+    // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
+    let responseText;
+    if (openclawReady) {
+      try {
+        responseText = await enqueueMessage(bridgeText);
+      } catch (bridgeErr) {
+        console.error(
+          `[contract] Async bridge error, falling back to shim: ${bridgeErr.message}`,
+        );
+        responseText = "";
+      }
+      if (!responseText || !responseText.trim()) {
+        console.warn(
+          "[contract] Async bridge returned empty — falling back to lightweight agent",
+        );
+        try {
+          responseText = await agent.chat(bridgeText, actorId, Date.now() + 30000);
+        } catch (agentErr) {
+          responseText =
+            "I'm having trouble right now. Please try again in a moment.";
+          console.error(
+            `[contract] Async lightweight agent fallback error: ${agentErr.message}`,
+          );
+        }
+      }
+    } else if (proxyReady) {
+      console.log("[contract] Async routing via lightweight agent (warm-up)");
+      try {
+        // No timeout limit in async mode — container can run as long as needed
+        responseText = await agent.chat(bridgeText, actorId, Date.now() + 3600000);
+      } catch (agentErr) {
+        responseText =
+          "I'm having trouble right now. Please try again in a moment.";
+        console.error(
+          `[contract] Async lightweight agent error: ${agentErr.message}`,
+        );
+      }
+    } else {
+      responseText = "I'm starting up — please try again in a moment.";
+    }
+
+    // Extract [SEND_FILE:filename] markers and strip from visible text
+    const { files, cleanText } = extractFileMarkers(responseText, currentNamespace);
+
+    // Deliver response directly to channel
+    console.log(
+      `[contract] Delivering async response (${cleanText.length} chars, ${files.length} files) to ${channel}:${chatId}`,
+    );
+    await channelSender.deliverResponse(
+      channel, chatId, cleanText, files.length > 0 ? files : null, tokens,
+    );
+    console.log("[contract] Async response delivered successfully");
+  } catch (err) {
+    console.error(`[contract] processAndDeliver failed: ${err.message}`);
+    // Send error message to user
+    try {
+      const errorMsg =
+        "I'm sorry, something went wrong while processing your request. Please try again.";
+      await channelSender.deliverResponse(
+        channel, chatId, errorMsg, null, tokens,
+      );
+    } catch (e) {
+      console.error(
+        `[contract] Failed to send error message to channel: ${e.message}`,
+      );
+    }
+  } finally {
+    // Stop typing indicator and progress timer
+    if (typingTimer) clearInterval(typingTimer);
+    clearTimeout(progressTimer);
+  }
+}
+
+/**
  * AgentCore contract HTTP server.
  */
 const server = http.createServer(async (req, res) => {
@@ -1300,7 +1464,7 @@ const server = http.createServer(async (req, res) => {
 
         // Chat action — lazy init and bridge
         if (action === "chat") {
-          const { userId, actorId, channel, message } = payload;
+          const { userId, actorId, channel, message, chatId, channelTarget } = payload;
           if (!userId || !actorId || !message) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(
@@ -1309,12 +1473,30 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
+          // Store channel info for async mode
+          if (chatId) {
+            currentChatId = chatId;
+            currentChannel = channel;
+          }
+
           // Trigger init if not done yet (blocks until proxy is ready)
           if (!proxyReady && !initInProgress) {
             try {
               await init(userId, actorId, channel || "unknown");
             } catch (err) {
               console.error(`[contract] Init failed: ${err.message}`);
+              // In async mode, send error directly to channel
+              if (chatId) {
+                const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+                channelSender.deliverResponse(
+                  channel, chatId,
+                  "I'm having trouble starting up. Please try again in a moment.",
+                  null, tokens,
+                ).catch((e) => console.error(`[contract] Error delivery failed: ${e.message}`));
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ status: "accepted", userId }));
+                return;
+              }
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(
                 JSON.stringify({
@@ -1335,6 +1517,17 @@ const server = http.createServer(async (req, res) => {
               console.error(
                 `[contract] Init (in-progress) failed: ${err.message}`,
               );
+              if (chatId) {
+                const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+                channelSender.deliverResponse(
+                  channel, chatId,
+                  "I'm still starting up. Please try again in a moment.",
+                  null, tokens,
+                ).catch((e) => console.error(`[contract] Error delivery failed: ${e.message}`));
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ status: "accepted", userId }));
+                return;
+              }
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(
                 JSON.stringify({
@@ -1351,6 +1544,20 @@ const server = http.createServer(async (req, res) => {
 
           const bridgeText = buildBridgeText(message);
 
+          // --- Async mode: return "accepted" immediately, process in background ---
+          if (chatId) {
+            console.log(`[contract] Async mode: chatId=${chatId} channel=${channel}`);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "accepted", userId: currentUserId }));
+
+            // Process and deliver in background (fire-and-forget)
+            processAndDeliver(bridgeText, actorId, channel, chatId).catch((err) => {
+              console.error(`[contract] processAndDeliver error: ${err.message}`);
+            });
+            return;
+          }
+
+          // --- Sync mode (no chatId): existing behavior for backward compat + cron ---
           // Route based on readiness: OpenClaw (full) > lightweight agent (shim)
           let responseText;
           if (openclawReady) {

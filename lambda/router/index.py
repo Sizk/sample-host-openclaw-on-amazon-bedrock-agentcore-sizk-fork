@@ -47,7 +47,9 @@ agentcore_client = boto3.client(
     "bedrock-agentcore",
     region_name=AWS_REGION,
     config=Config(
-        read_timeout=max(LAMBDA_TIMEOUT_SECONDS - 15, 60),
+        # Async mode: container returns "accepted" in ~1-5s, but keep a generous
+        # timeout for sync fallback (old container versions or cron Lambda reuse).
+        read_timeout=60,
         connect_timeout=10,
         retries={"max_attempts": 0},
     ),
@@ -394,18 +396,24 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
 # AgentCore invocation
 # ---------------------------------------------------------------------------
 
-def invoke_agent_runtime(session_id, user_id, actor_id, channel, message):
+def invoke_agent_runtime(session_id, user_id, actor_id, channel, message, chat_id=None):
     """Invoke the AgentCore Runtime with a per-user session.
 
     Message can be a plain string or a structured dict with text + images.
+    If chat_id is provided, the container will deliver the response directly
+    to the channel (async mode) and return {"status": "accepted"} immediately.
     """
-    payload = json.dumps({
+    payload_dict = {
         "action": "chat",
         "userId": user_id,
         "actorId": actor_id,
         "channel": channel,
         "message": message,
-    }).encode()
+    }
+    if chat_id:
+        payload_dict["chatId"] = str(chat_id)
+        payload_dict["channelTarget"] = str(chat_id)
+    payload = json.dumps(payload_dict).encode()
 
     try:
         logger.info("Invoking AgentCore: arn=%s qualifier=%s session=%s", AGENTCORE_RUNTIME_ARN, AGENTCORE_QUALIFIER, session_id)
@@ -1084,6 +1092,250 @@ def _build_structured_message(text, s3_key, content_type, filename=""):
     return msg
 
 
+def _build_multi_image_message(text, image_refs):
+    """Build a structured message dict with text and multiple image references."""
+    return {
+        "text": text or "",
+        "images": [{"s3Key": ref["s3Key"], "contentType": ref["contentType"]}
+                   for ref in image_refs],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Telegram media group buffering (event-based: parallel upload + async flush)
+# ---------------------------------------------------------------------------
+#
+# When Telegram sends N photos as a media group, N separate webhooks arrive.
+# Each Lambda invocation uploads its image in parallel and stores a ref in
+# DynamoDB. The FIRST store starts an async flush chain that polls DynamoDB
+# until no new images arrive for QUIET_PERIOD seconds, then dispatches all
+# images in a single AgentCore invocation. No Lambda ever sleeps.
+
+MEDIA_GROUP_QUIET_PERIOD = 3  # Seconds of inactivity before dispatching
+MEDIA_GROUP_MAX_RETRIES = 30  # Max flush re-invokes (~15s at ~500ms each)
+
+
+def _store_media_group_image(media_group_id, image_ref, text, chat_id, actor_id, user_id):
+    """Append an image to a media group record in DynamoDB.
+
+    Creates the record on first call, appends images on subsequent calls.
+    Returns True if this is the FIRST image stored (caller should start flush chain).
+    Returns False if the image was appended to an existing record.
+    Returns None on failure.
+    """
+    now_epoch = str(time.time())  # Stored as string for DynamoDB number compat
+    ttl_epoch = int(time.time()) + 120  # Auto-expire after 2 minutes
+
+    try:
+        resp = identity_table.update_item(
+            Key={"PK": f"MEDIAGRP#{media_group_id}", "SK": "MEDIAGRP"},
+            UpdateExpression=(
+                "SET #imgs = list_append(if_not_exists(#imgs, :empty_list), :new_img), "
+                "#chatId = if_not_exists(#chatId, :chatId), "
+                "#actorId = if_not_exists(#actorId, :actorId), "
+                "#userId = if_not_exists(#userId, :userId), "
+                "#channel = if_not_exists(#channel, :channel), "
+                "#claimed = if_not_exists(#claimed, :false_val), "
+                "#lastUpd = :now_epoch, "
+                "#ttl = :ttl"
+            ),
+            ExpressionAttributeNames={
+                "#imgs": "images",
+                "#chatId": "chatId",
+                "#actorId": "actorId",
+                "#userId": "userId",
+                "#channel": "channel",
+                "#claimed": "claimed",
+                "#lastUpd": "lastUpdated",
+                "#ttl": "ttl",
+            },
+            ExpressionAttributeValues={
+                ":new_img": [image_ref],
+                ":empty_list": [],
+                ":chatId": str(chat_id),
+                ":actorId": actor_id,
+                ":userId": user_id,
+                ":channel": "telegram",
+                ":false_val": False,
+                ":now_epoch": now_epoch,
+                ":ttl": ttl_epoch,
+            },
+            ReturnValues="ALL_OLD",
+        )
+        # If ALL_OLD has no Attributes, this was a new record (first image)
+        is_first = not resp.get("Attributes")
+
+        # Store caption separately — only set if non-empty and not yet stored
+        if text:
+            try:
+                identity_table.update_item(
+                    Key={"PK": f"MEDIAGRP#{media_group_id}", "SK": "MEDIAGRP"},
+                    UpdateExpression="SET #txt = if_not_exists(#txt, :txt)",
+                    ExpressionAttributeNames={"#txt": "text"},
+                    ExpressionAttributeValues={":txt": text},
+                )
+            except ClientError:
+                pass  # Non-fatal — caption may already be set
+
+        logger.info(
+            "Stored media group image: group=%s is_first=%s",
+            media_group_id, is_first,
+        )
+        return is_first
+    except ClientError as e:
+        logger.error("Failed to store media group image: %s", e)
+        return None
+
+
+def _claim_media_group(media_group_id):
+    """Try to claim a media group for dispatch.
+
+    Uses a conditional update to ensure only one Lambda invocation claims
+    the group. Returns the full record if claim succeeds, None otherwise.
+    """
+    try:
+        resp = identity_table.update_item(
+            Key={"PK": f"MEDIAGRP#{media_group_id}", "SK": "MEDIAGRP"},
+            UpdateExpression="SET #claimed = :true_val",
+            ConditionExpression="#claimed = :false_val",
+            ExpressionAttributeNames={"#claimed": "claimed"},
+            ExpressionAttributeValues={
+                ":true_val": True,
+                ":false_val": False,
+            },
+            ReturnValues="ALL_NEW",
+        )
+        item = resp.get("Attributes", {})
+        logger.info(
+            "Claimed media group: group=%s images=%d",
+            media_group_id, len(item.get("images", [])),
+        )
+        return item
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            logger.info("Media group already claimed: group=%s", media_group_id)
+            return None
+        logger.error("Failed to claim media group: %s", e)
+        return None
+
+
+def _self_invoke_flush(media_group_id, retry=0):
+    """Fire an async self-invocation to check if the media group is ready to dispatch."""
+    try:
+        lambda_client.invoke(
+            FunctionName=LAMBDA_FUNCTION_NAME,
+            InvocationType="Event",
+            Payload=json.dumps({
+                "_media_group_flush": True,
+                "_media_group_id": media_group_id,
+                "_retry": retry,
+            }).encode(),
+        )
+    except Exception as e:
+        logger.error("Media group flush self-invoke failed: %s", e)
+
+
+def _handle_media_group_flush(media_group_id, retry):
+    """Async flush handler: check if media group is quiet, then dispatch.
+
+    Called via async self-invoke. If images are still arriving (lastUpdated
+    is recent), re-invokes itself. Once quiet period passes, claims the
+    group and dispatches all images to AgentCore.
+    """
+    if retry >= MEDIA_GROUP_MAX_RETRIES:
+        logger.warning("Media group %s: max retries reached — force dispatching", media_group_id)
+        record = _claim_media_group(media_group_id)
+        if record:
+            _dispatch_media_group(record)
+        return
+
+    try:
+        resp = identity_table.get_item(
+            Key={"PK": f"MEDIAGRP#{media_group_id}", "SK": "MEDIAGRP"},
+        )
+    except ClientError as e:
+        logger.error("Media group flush read failed: %s", e)
+        return
+
+    item = resp.get("Item")
+    if not item:
+        logger.warning("Media group %s: record not found", media_group_id)
+        return
+    if item.get("claimed"):
+        logger.info("Media group %s: already dispatched", media_group_id)
+        return
+
+    last_updated = float(item.get("lastUpdated", "0"))
+    elapsed = time.time() - last_updated
+    image_count = len(item.get("images", []))
+
+    if elapsed >= MEDIA_GROUP_QUIET_PERIOD:
+        # Quiet period passed — claim and dispatch
+        logger.info(
+            "Media group %s: quiet for %.1fs (%d images) — dispatching",
+            media_group_id, elapsed, image_count,
+        )
+        record = _claim_media_group(media_group_id)
+        if record:
+            _dispatch_media_group(record)
+    else:
+        # Still receiving images — re-invoke flush
+        logger.info(
+            "Media group %s: still active (%.1fs ago, %d images) — retry %d",
+            media_group_id, elapsed, image_count, retry,
+        )
+        _self_invoke_flush(media_group_id, retry + 1)
+
+
+def _dispatch_media_group(record):
+    """Dispatch a complete media group to AgentCore.
+
+    Reads all accumulated images from the DynamoDB record and sends
+    them as a single multi-image structured message.
+    """
+    images = record.get("images", [])
+    caption = record.get("text", "")
+    user_id = record.get("userId", "")
+    actor_id = record.get("actorId", "")
+    chat_id = record.get("chatId", "")
+    channel = record.get("channel", "telegram")
+
+    if not images or not user_id or not actor_id or not chat_id:
+        logger.error("Media group dispatch: missing required fields")
+        return
+
+    agent_message = _build_multi_image_message(caption, images)
+    session_id = get_or_create_session(user_id)
+
+    logger.info(
+        "Dispatching media group: user=%s images=%d caption_len=%d",
+        user_id, len(images), len(caption),
+    )
+
+    token = _get_telegram_token()
+    send_telegram_typing(int(chat_id), token)
+
+    result = invoke_agent_runtime(
+        session_id, user_id, actor_id, channel, agent_message,
+        chat_id=chat_id,
+    )
+
+    # Async mode: container delivers directly
+    if result.get("status") == "accepted":
+        logger.info("Media group dispatched (async mode) to chat_id=%s", chat_id)
+        return
+
+    # Sync fallback
+    response_text = result.get("response", "Sorry, I couldn't process your images.")
+    response_text = _extract_text_from_content_blocks(response_text)
+    if len(response_text) <= 4096:
+        send_telegram_message(int(chat_id), response_text, token)
+    else:
+        for i in range(0, len(response_text), 4096):
+            send_telegram_message(int(chat_id), response_text[i:i + 4096], token)
+    _send_response_files(result.get("files"), "telegram", int(chat_id), token)
+
+
 # ---------------------------------------------------------------------------
 # Webhook handlers
 # ---------------------------------------------------------------------------
@@ -1174,7 +1426,40 @@ def handle_telegram(body):
 
     # Build message payload (structured if file attached, plain string if text-only)
     agent_message = text
-    if has_image:
+
+    # --- Media group handling (multiple photos sent at once) ---
+    # Each Lambda uploads its image in parallel and returns immediately.
+    # The first image starts an async flush chain that dispatches once quiet.
+    media_group_id = message.get("media_group_id")
+    if media_group_id and has_image:
+        namespace = actor_id.replace(":", "_")
+        image_bytes, content_type, _ = _download_telegram_image(message, token)
+        if not image_bytes:
+            logger.warning("Media group: failed to download image for group=%s", media_group_id)
+            return
+        s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
+        if not s3_key:
+            logger.warning("Media group: failed to upload image for group=%s", media_group_id)
+            return
+
+        # Store image ref in DynamoDB (parallel-safe via atomic list_append)
+        image_ref = {"s3Key": s3_key, "contentType": content_type}
+        is_first = _store_media_group_image(
+            media_group_id, image_ref, text, chat_id, actor_id, resolved_user_id,
+        )
+        if is_first is None:
+            return  # Store failed
+
+        # Every image Lambda fires a flush invoke — provides redundancy if
+        # any single flush chain gets throttled by Lambda async invoke limits.
+        # DynamoDB conditional claim ensures only one dispatch happens.
+        _self_invoke_flush(media_group_id, retry=0)
+
+        # ALL Lambdas return immediately — no sleeping, no blocking
+        return
+
+    # --- Single image handling (no media group) ---
+    elif has_image:
         namespace = actor_id.replace(":", "_")
         image_bytes, content_type, _ = _download_telegram_image(message, token)
         if image_bytes:
@@ -1211,19 +1496,23 @@ def handle_telegram(body):
         resolved_user_id, actor_id, session_id, len(text), image_count, doc_count,
     )
 
-    # Invoke AgentCore with periodic typing indicator
-    stop_typing = threading.Event()
-    typing_thread = threading.Thread(
-        target=_periodic_typing,
-        args=(chat_id, token, stop_typing),
-        daemon=True,
+    # Send initial typing indicator before invoke
+    send_telegram_typing(chat_id, token)
+
+    # Invoke AgentCore with chat_id for async direct response mode.
+    # The container will send the response directly to Telegram/Slack,
+    # so the Lambda doesn't need to block waiting for the full response.
+    result = invoke_agent_runtime(
+        session_id, resolved_user_id, actor_id, "telegram", agent_message,
+        chat_id=chat_id,
     )
-    typing_thread.start()
-    try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "telegram", agent_message)
-    finally:
-        stop_typing.set()
-        typing_thread.join(timeout=2)
+
+    # If container accepted the request (async mode), it will deliver directly
+    if result.get("status") == "accepted":
+        logger.info("Telegram: async mode — container will deliver response to chat_id=%s", chat_id)
+        return
+
+    # Fallback: sync mode (container returned full response — e.g., old container version)
     logger.info("AgentCore result keys: %s", list(result.keys()) if isinstance(result, dict) else type(result))
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw
@@ -1323,17 +1612,21 @@ def handle_slack(body, headers=None):
     agent_message = text
     if has_image:
         namespace = actor_id.replace(":", "_")
-        file_info = image_files[0]
-        image_bytes, content_type, _ = _download_slack_file(file_info, bot_token)
-        if image_bytes:
-            s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
-            if s3_key:
-                agent_message = _build_structured_message(text, s3_key, content_type)
+        # Process all image files (Slack sends all files in one event — no buffering needed)
+        uploaded_images = []
+        for file_info in image_files:
+            image_bytes, content_type, _ = _download_slack_file(file_info, bot_token)
+            if image_bytes:
+                s3_key = _upload_image_to_s3(image_bytes, namespace, content_type)
+                if s3_key:
+                    uploaded_images.append({"s3Key": s3_key, "contentType": content_type})
+        if uploaded_images:
+            if len(uploaded_images) == 1:
+                agent_message = _build_structured_message(text, uploaded_images[0]["s3Key"], uploaded_images[0]["contentType"])
             else:
-                send_slack_message(channel_id, "Sorry, I couldn't process that image. Please try again.", bot_token)
-                return {"statusCode": 200, "body": "ok"}
+                agent_message = _build_multi_image_message(text, uploaded_images)
         else:
-            send_slack_message(channel_id, "Sorry, I couldn't download that image. Please try again.", bot_token)
+            send_slack_message(channel_id, "Sorry, I couldn't process the image(s). Please try again.", bot_token)
             return {"statusCode": 200, "body": "ok"}
     elif has_document:
         namespace = actor_id.replace(":", "_")
@@ -1358,19 +1651,18 @@ def handle_slack(body, headers=None):
         resolved_user_id, actor_id, session_id, len(text), has_file,
     )
 
-    # Invoke AgentCore with progress notification for long requests
-    stop_notify = threading.Event()
-    notify_thread = threading.Thread(
-        target=_slack_progress_notify,
-        args=(channel_id, bot_token, stop_notify),
-        daemon=True,
+    # Invoke AgentCore with channel_id for async direct response mode.
+    result = invoke_agent_runtime(
+        session_id, resolved_user_id, actor_id, "slack", agent_message,
+        chat_id=channel_id,
     )
-    notify_thread.start()
-    try:
-        result = invoke_agent_runtime(session_id, resolved_user_id, actor_id, "slack", agent_message)
-    finally:
-        stop_notify.set()
-        notify_thread.join(timeout=2)
+
+    # If container accepted the request (async mode), it will deliver directly
+    if result.get("status") == "accepted":
+        logger.info("Slack: async mode — container will deliver response to channel_id=%s", channel_id)
+        return {"statusCode": 200, "body": "ok"}
+
+    # Fallback: sync mode (container returned full response — e.g., old container version)
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     response_text = _extract_text_from_content_blocks(response_text)
 
@@ -1388,6 +1680,14 @@ def handle_slack(body, headers=None):
 
 def handler(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
+    # Media group flush — async self-invoke to check if group is ready to dispatch
+    if event.get("_media_group_flush"):
+        _handle_media_group_flush(
+            event["_media_group_id"],
+            event.get("_retry", 0),
+        )
+        return {"statusCode": 200, "body": "ok"}
+
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
         channel = event.get("_channel")

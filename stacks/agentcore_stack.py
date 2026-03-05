@@ -36,6 +36,8 @@ class AgentCoreStack(Stack):
         cognito_user_pool_id: str,
         cognito_password_secret_name: str,
         gateway_token_secret_name: str,
+        telegram_token_secret_name: str,
+        slack_token_secret_name: str,
         **kwargs,
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
@@ -264,6 +266,10 @@ class AgentCoreStack(Stack):
                 # SUBAGENT_BEDROCK_MODEL_ID is forwarded by the contract server
                 # to the proxy for Bedrock model routing.
                 "SUBAGENT_BEDROCK_MODEL_ID": subagent_model_id,
+                # Channel bot tokens — used by channel-sender.js for async direct
+                # response delivery (container sends to Telegram/Slack directly).
+                "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
+                "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
             },
             description="OpenClaw messaging bridge on AgentCore Runtime (per-user sessions)",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
