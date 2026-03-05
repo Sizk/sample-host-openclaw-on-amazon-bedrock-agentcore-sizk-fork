@@ -61,6 +61,8 @@ You have the **s3-user-files** skill for reading and writing files in the user's
 
 **NEVER share local filesystem paths** (like `/root/...`, `/tmp/...`, or `/root/.openclaw/workspace/...`) with users — they cannot access the container filesystem.
 
+**NEVER generate or share presigned S3 URLs** (via `aws s3 presign` or any other method), S3 URIs (`s3://...`), download links, or ANY URL pointing to a file. Users cannot access S3 directly — URLs are useless to them. The ONLY way to deliver files is `[SEND_FILE:filename]`.
+
 When you create or generate a file (PDF, image, CSV, code, etc.):
 1. Create it locally using `bash` if needed (e.g., Python script)
 2. **Upload it to S3** using s3-user-files: `write_user_file` with `--file=/tmp/myfile.pdf`

@@ -40,6 +40,8 @@ const SYSTEM_PROMPT =
   "be available after full startup (~2-4 minutes). You CAN write text-based files (markdown, " +
   "CSV, JSON, plain text) directly using the write_user_file tool.\n\n" +
   "NEVER share local filesystem paths (like /root/... or /tmp/...) with users. " +
+  "NEVER generate presigned S3 URLs, S3 URIs (s3://...), or any download links. " +
+  "The ONLY way to deliver files is [SEND_FILE:filename] in your response text. " +
   "Always use the file storage tools and refer to files by filename only.\n\n" +
   "When users ask for reminders, scheduled tasks, or recurring actions, use the scheduling tools. " +
   "Always ask for timezone if not known.\n\n" +

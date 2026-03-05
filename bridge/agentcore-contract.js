@@ -381,6 +381,9 @@ const AGENTS_MD_CONTENT = [
   "",
   "**NEVER share local filesystem paths** (like `/root/...` or `/tmp/...`) with users — they are meaningless outside the container.",
   "",
+  "**NEVER generate or share presigned S3 URLs** (`aws s3 presign`), S3 URIs (`s3://...`), download links, or ANY URL pointing to a file.",
+  "URLs do not work — users cannot access S3 directly. The ONLY way to deliver files is `[SEND_FILE:filename]`.",
+  "",
   "When you create or generate a file (PDF, image, CSV, etc.):",
   "1. Create it locally using bash (e.g., Python script, Node.js, etc.)",
   "2. **Upload it to S3** using s3-user-files: `write_user_file` with `--file=/tmp/report.pdf`",
@@ -991,53 +994,94 @@ async function bridgeMessage(message, timeoutMs = 560000) {
  * Handles structured messages with images and plain text.
  */
 /**
- * Extract [SEND_FILE:filename] markers from response text.
+ * Extract [SEND_FILE:filename] markers AND S3 URLs from response text.
  * Returns { files: [{s3Key, filename, contentType}], cleanText: strippedText }.
+ *
+ * Two-pass detection:
+ *   1. Explicit [SEND_FILE:filename] markers (primary, instruction-based)
+ *   2. S3 presigned URLs / S3 URIs containing the user-files bucket name (fallback)
+ *
+ * The fallback catches cases where the model generates a presigned URL or S3 URI
+ * instead of using the [SEND_FILE:] marker, ensuring files are always delivered
+ * as native Telegram/Slack attachments rather than raw URLs.
  */
 function extractFileMarkers(responseText, namespace) {
-  const MARKER_RE = /\[SEND_FILE:([^\]]+)\]/g;
   const files = [];
-  let match;
-  while ((match = MARKER_RE.exec(responseText)) !== null) {
-    const filename = match[1].trim();
-    if (!filename) continue;
-    // Sanitize same as skills/s3-user-files/common.js sanitize()
-    const sanitize = (s) => {
-      let r = s;
-      while (r.includes("..")) r = r.replace(/\.\./g, "");
-      return r.replace(/[^a-zA-Z0-9_\-.]/g, "_").slice(0, 256);
-    };
+  const sanitize = (s) => {
+    let r = s;
+    while (r.includes("..")) r = r.replace(/\.\./g, "");
+    return r.replace(/[^a-zA-Z0-9_\-.]/g, "_").slice(0, 256);
+  };
+  const CONTENT_TYPES = {
+    pdf: "application/pdf",
+    jpg: "image/jpeg", jpeg: "image/jpeg",
+    png: "image/png", gif: "image/gif", webp: "image/webp",
+    csv: "text/csv", json: "application/json",
+    txt: "text/plain", md: "text/markdown",
+    html: "text/html", xml: "application/xml", zip: "application/zip",
+  };
+  const addFile = (filename) => {
+    if (!filename) return;
+    if (files.some((f) => f.filename === filename)) return;
     const ext = (filename.split(".").pop() || "").toLowerCase();
-    const CONTENT_TYPES = {
-      pdf: "application/pdf",
-      jpg: "image/jpeg", jpeg: "image/jpeg",
-      png: "image/png", gif: "image/gif", webp: "image/webp",
-      csv: "text/csv", json: "application/json",
-      txt: "text/plain", md: "text/markdown",
-      html: "text/html", xml: "application/xml", zip: "application/zip",
-    };
     files.push({
       s3Key: `${sanitize(namespace)}/${sanitize(filename)}`,
       filename,
       contentType: CONTENT_TYPES[ext] || "application/octet-stream",
     });
+  };
+
+  // Pass 1: Explicit [SEND_FILE:filename] markers
+  const MARKER_RE = /\[SEND_FILE:([^\]]+)\]/g;
+  let match;
+  while ((match = MARKER_RE.exec(responseText)) !== null) {
+    addFile(match[1].trim());
   }
-  const cleanText = responseText.replace(MARKER_RE, "").trim();
+  let cleanText = responseText.replace(MARKER_RE, "");
+
+  // Pass 2: S3 presigned URLs and S3 URIs (fallback for model non-compliance)
+  const bucket = process.env.S3_USER_FILES_BUCKET;
+  if (bucket && namespace) {
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Match https://...{bucket}... or s3://{bucket}/... (greedy to end of non-whitespace)
+    const S3_REF_RE = new RegExp(
+      `(?:https?://[^\\s<>)\\]]*${esc(bucket)}[^\\s<>)\\]]*|s3://${esc(bucket)}/[^\\s<>)\\]]+)`,
+      "gi",
+    );
+    let urlMatch;
+    while ((urlMatch = S3_REF_RE.exec(cleanText)) !== null) {
+      const url = urlMatch[0].replace(/[.,;:!?]+$/, ""); // strip trailing punctuation
+      const pathPart = url.split("?")[0]; // remove query params (presigned URLs)
+      // Look for namespace in the path and extract the filename after it
+      const nsIdx = pathPart.indexOf(namespace + "/");
+      if (nsIdx >= 0) {
+        const afterNs = pathPart.slice(nsIdx + namespace.length + 1);
+        const rawName = afterNs.split("/").pop() || "";
+        try {
+          addFile(decodeURIComponent(rawName));
+        } catch {
+          addFile(rawName);
+        }
+      }
+    }
+    cleanText = cleanText.replace(S3_REF_RE, "");
+  }
+
+  // Clean up residual whitespace (double spaces, trailing colons from "Download: <url>")
+  cleanText = cleanText.replace(/[ \t]{2,}/g, " ").trim();
   return { files, cleanText };
 }
 
 function buildBridgeText(message) {
-  if (
-    typeof message === "object" &&
-    message !== null &&
-    Array.isArray(message.images)
-  ) {
-    return (
-      (message.text || "") +
-      "\n\n[OPENCLAW_IMAGES:" +
-      JSON.stringify(message.images) +
-      "]"
-    );
+  if (typeof message === "object" && message !== null) {
+    let text = message.text || "";
+    if (Array.isArray(message.images) && message.images.length > 0) {
+      text += "\n\n[OPENCLAW_IMAGES:" + JSON.stringify(message.images) + "]";
+    }
+    if (Array.isArray(message.documents) && message.documents.length > 0) {
+      text += "\n\n[OPENCLAW_DOCUMENTS:" + JSON.stringify(message.documents) + "]";
+    }
+    if (text) return text;
   }
   if (typeof message === "string") {
     return message;
