@@ -194,11 +194,18 @@ class RouterStack(Stack):
             )
         )
 
-        # S3 PutObject for image uploads (scoped to _uploads/ prefix)
+        # S3 PutObject for image/document uploads (scoped to _uploads/ prefix)
+        # S3 GetObject for file delivery via [SEND_FILE:] (any file in user namespace)
         self.router_fn.add_to_role_policy(
             iam.PolicyStatement(
                 actions=["s3:PutObject"],
                 resources=[f"{user_files_bucket_arn}/*/_uploads/*"],
+            )
+        )
+        self.router_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject"],
+                resources=[f"{user_files_bucket_arn}/*"],
             )
         )
 
@@ -240,12 +247,14 @@ class RouterStack(Stack):
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
                     "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
                     "grant_read_write_data adds index wildcards. S3 PutObject "
-                    "scoped to */_uploads/* prefix for image uploads.",
+                    "scoped to */_uploads/* prefix for file uploads. S3 GetObject "
+                    "on bucket/* needed to download user files for [SEND_FILE:] delivery.",
                     applies_to=[
                         f"Resource::arn:aws:bedrock-agentcore:{region}:{account}:runtime/<AgentRuntime.AgentRuntimeId>/*",
                         f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",
+                        "Resource::<UserFilesBucketCFDFD8C0.Arn>/*",
                     ],
                 ),
                 cdk_nag.NagPackSuppression(

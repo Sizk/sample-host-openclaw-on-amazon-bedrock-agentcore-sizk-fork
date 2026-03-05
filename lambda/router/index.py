@@ -838,13 +838,36 @@ def _slack_progress_notify(channel_id, bot_token, stop_event, notify_after_s=30)
 # ---------------------------------------------------------------------------
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-MAX_IMAGE_BYTES = 3_750_000  # 3.75 MB — Bedrock Converse limit
+MAX_IMAGE_BYTES = 3_750_000  # 3.75 MB — Bedrock Converse image limit
 CONTENT_TYPE_TO_EXT = {
     "image/jpeg": "jpeg",
     "image/png": "png",
     "image/gif": "gif",
     "image/webp": "webp",
 }
+
+ALLOWED_DOCUMENT_TYPES = {
+    "application/pdf",
+    "text/csv",
+    "text/plain",
+    "application/json",
+    "text/markdown",
+    "text/html",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+MAX_DOCUMENT_BYTES = 4_500_000  # 4.5 MB — Bedrock Converse document limit
+DOCUMENT_TYPE_TO_EXT = {
+    "application/pdf": "pdf",
+    "text/csv": "csv",
+    "text/plain": "txt",
+    "application/json": "json",
+    "text/markdown": "md",
+    "text/html": "html",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+}
+ALLOWED_FILE_TYPES = ALLOWED_IMAGE_TYPES | ALLOWED_DOCUMENT_TYPES
 
 
 def _upload_image_to_s3(image_bytes, namespace, content_type):
@@ -879,6 +902,84 @@ def _upload_image_to_s3(image_bytes, namespace, content_type):
     except Exception as e:
         logger.error("S3 image upload failed: %s", e)
         return None
+
+
+def _upload_document_to_s3(doc_bytes, namespace, content_type, original_filename=""):
+    """Upload document bytes to S3 and return the S3 key, or None on failure.
+
+    S3 key: {namespace}/_uploads/doc_{timestamp}_{hex}.{ext}
+    """
+    if not USER_FILES_BUCKET:
+        logger.warning("USER_FILES_BUCKET not configured — cannot upload document")
+        return None
+    if content_type not in ALLOWED_DOCUMENT_TYPES:
+        logger.warning("Rejected document with unsupported content type: %s", content_type)
+        return None
+    if len(doc_bytes) > MAX_DOCUMENT_BYTES:
+        logger.warning("Rejected document: %d bytes exceeds limit of %d", len(doc_bytes), MAX_DOCUMENT_BYTES)
+        return None
+
+    ext = DOCUMENT_TYPE_TO_EXT.get(content_type, "bin")
+    timestamp = int(time.time())
+    hex_suffix = uuid.uuid4().hex[:8]
+    s3_key = f"{namespace}/_uploads/doc_{timestamp}_{hex_suffix}.{ext}"
+
+    try:
+        s3_client.put_object(
+            Bucket=USER_FILES_BUCKET,
+            Key=s3_key,
+            Body=doc_bytes,
+            ContentType=content_type,
+        )
+        logger.info("Uploaded document to s3://%s/%s (%d bytes)", USER_FILES_BUCKET, s3_key, len(doc_bytes))
+        return s3_key
+    except Exception as e:
+        logger.error("S3 document upload failed: %s", e)
+        return None
+
+
+def _download_telegram_document(message, token):
+    """Download a non-image document from a Telegram message.
+
+    Returns (bytes, content_type, filename) or (None, None, None).
+    """
+    doc = message.get("document", {})
+    mime = doc.get("mime_type", "")
+    if mime not in ALLOWED_DOCUMENT_TYPES:
+        return None, None, None
+
+    file_id = doc.get("file_id")
+    if not file_id:
+        return None, None, None
+
+    original_filename = doc.get("file_name", "")
+
+    try:
+        safe_file_id = quote(str(file_id), safe="")
+        url = f"https://api.telegram.org/bot{token}/getFile?file_id={safe_file_id}"
+        req = urllib_request.Request(url)
+        resp = urllib_request.urlopen(req, timeout=15)
+        data = json.loads(resp.read().decode("utf-8"))
+        file_path = data.get("result", {}).get("file_path", "")
+        if not file_path:
+            logger.warning("Telegram getFile returned no file_path for document file_id=%s", file_id)
+            return None, None, None
+
+        file_size = data.get("result", {}).get("file_size", 0)
+        if file_size > MAX_DOCUMENT_BYTES:
+            logger.warning("Telegram document too large: %d bytes", file_size)
+            return None, None, None
+
+        download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+        req = urllib_request.Request(download_url)
+        resp = urllib_request.urlopen(req, timeout=15)
+        doc_bytes = resp.read()
+
+        filename = original_filename or (file_path.split("/")[-1] if "/" in file_path else file_path)
+        return doc_bytes, mime, filename
+    except Exception as e:
+        logger.error("Telegram document download failed: %s", e)
+        return None, None, None
 
 
 def _download_telegram_image(message, token):
@@ -937,17 +1038,18 @@ def _download_telegram_image(message, token):
 
 
 def _download_slack_file(file_info, bot_token):
-    """Download an image file from Slack.
+    """Download an image or document file from Slack.
 
     Returns (bytes, content_type, filename) or (None, None, None).
     """
     mimetype = file_info.get("mimetype", "")
-    if mimetype not in ALLOWED_IMAGE_TYPES:
+    if mimetype not in ALLOWED_FILE_TYPES:
         return None, None, None
 
     file_size = file_info.get("size", 0)
-    if file_size > MAX_IMAGE_BYTES:
-        logger.warning("Slack file too large: %d bytes", file_size)
+    max_bytes = MAX_IMAGE_BYTES if mimetype in ALLOWED_IMAGE_TYPES else MAX_DOCUMENT_BYTES
+    if file_size > max_bytes:
+        logger.warning("Slack file too large: %d bytes (limit %d)", file_size, max_bytes)
         return None, None, None
 
     download_url = file_info.get("url_private_download") or file_info.get("url_private")
@@ -969,12 +1071,17 @@ def _download_slack_file(file_info, bot_token):
         return None, None, None
 
 
-def _build_structured_message(text, s3_key, content_type):
-    """Build a structured message dict with text and image reference."""
-    return {
-        "text": text or "",
-        "images": [{"s3Key": s3_key, "contentType": content_type}],
-    }
+def _build_structured_message(text, s3_key, content_type, filename=""):
+    """Build a structured message dict with text and image/document reference."""
+    msg = {"text": text or ""}
+    if content_type in ALLOWED_IMAGE_TYPES:
+        msg["images"] = [{"s3Key": s3_key, "contentType": content_type}]
+    elif content_type in ALLOWED_DOCUMENT_TYPES:
+        doc_ref = {"s3Key": s3_key, "contentType": content_type}
+        if filename:
+            doc_ref["name"] = filename
+        msg["documents"] = [doc_ref]
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -1015,9 +1122,15 @@ def handle_telegram(body):
         message.get("photo")
         or (message.get("document", {}).get("mime_type", "") in ALLOWED_IMAGE_TYPES)
     )
+    # Detect document: document with allowed non-image mime type
+    has_document = bool(
+        not has_image
+        and message.get("document", {}).get("mime_type", "") in ALLOWED_DOCUMENT_TYPES
+    )
+    has_file = has_image or has_document
 
-    if not chat_id or not user_id_tg or (not text and not has_image):
-        logger.info("Telegram: ignoring non-text/non-image or missing-user message")
+    if not chat_id or not user_id_tg or (not text and not has_file):
+        logger.info("Telegram: ignoring non-text/non-file or missing-user message")
         return
 
     token = _get_telegram_token()
@@ -1059,7 +1172,7 @@ def handle_telegram(body):
     # Send typing indicator
     send_telegram_typing(chat_id, token)
 
-    # Build message payload (structured if image, plain string if text-only)
+    # Build message payload (structured if file attached, plain string if text-only)
     agent_message = text
     if has_image:
         namespace = actor_id.replace(":", "_")
@@ -1074,14 +1187,28 @@ def handle_telegram(body):
         else:
             send_telegram_message(chat_id, "Sorry, I couldn't download that image. Please try again.", token)
             return
+    elif has_document:
+        namespace = actor_id.replace(":", "_")
+        doc_bytes, content_type, filename = _download_telegram_document(message, token)
+        if doc_bytes:
+            s3_key = _upload_document_to_s3(doc_bytes, namespace, content_type, filename)
+            if s3_key:
+                agent_message = _build_structured_message(text, s3_key, content_type, filename)
+            else:
+                send_telegram_message(chat_id, "Sorry, I couldn't process that document. Please try again.", token)
+                return
+        else:
+            send_telegram_message(chat_id, "Sorry, I couldn't download that document. Please try again.", token)
+            return
 
     # Get or create session
     session_id = get_or_create_session(resolved_user_id)
 
     image_count = 0 if isinstance(agent_message, str) else len(agent_message.get("images", []))
+    doc_count = 0 if isinstance(agent_message, str) else len(agent_message.get("documents", []))
     logger.info(
-        "Telegram: user=%s actor=%s session=%s text_len=%d images=%d",
-        resolved_user_id, actor_id, session_id, len(text), image_count,
+        "Telegram: user=%s actor=%s session=%s text_len=%d images=%d docs=%d",
+        resolved_user_id, actor_id, session_id, len(text), image_count, doc_count,
     )
 
     # Invoke AgentCore with periodic typing indicator
@@ -1141,14 +1268,15 @@ def handle_slack(body, headers=None):
     slack_user_id = event.get("user", "")
     channel_id = event.get("channel", "")
 
-    # Detect image files attached to the message (strict allowed-type check)
-    image_files = [
-        f for f in (event.get("files") or [])
-        if f.get("mimetype", "") in ALLOWED_IMAGE_TYPES
-    ]
+    # Detect attached files (images and documents)
+    all_files = event.get("files") or []
+    image_files = [f for f in all_files if f.get("mimetype", "") in ALLOWED_IMAGE_TYPES]
+    document_files = [f for f in all_files if f.get("mimetype", "") in ALLOWED_DOCUMENT_TYPES]
     has_image = bool(image_files)
+    has_document = bool(document_files) and not has_image
+    has_file = has_image or has_document
 
-    if not slack_user_id or not channel_id or (not text and not has_image):
+    if not slack_user_id or not channel_id or (not text and not has_file):
         return {"statusCode": 200, "body": "ok"}
 
     # Ignore bot messages
@@ -1191,11 +1319,10 @@ def handle_slack(body, headers=None):
             send_slack_message(channel_id, "Invalid or expired link code. Please try again.", bot_token)
         return {"statusCode": 200, "body": "ok"}
 
-    # Build message payload (structured if image, plain string if text-only)
+    # Build message payload (structured if file attached, plain string if text-only)
     agent_message = text
     if has_image:
         namespace = actor_id.replace(":", "_")
-        # Use first image file
         file_info = image_files[0]
         image_bytes, content_type, _ = _download_slack_file(file_info, bot_token)
         if image_bytes:
@@ -1208,13 +1335,27 @@ def handle_slack(body, headers=None):
         else:
             send_slack_message(channel_id, "Sorry, I couldn't download that image. Please try again.", bot_token)
             return {"statusCode": 200, "body": "ok"}
+    elif has_document:
+        namespace = actor_id.replace(":", "_")
+        file_info = document_files[0]
+        doc_bytes, content_type, filename = _download_slack_file(file_info, bot_token)
+        if doc_bytes:
+            s3_key = _upload_document_to_s3(doc_bytes, namespace, content_type, filename)
+            if s3_key:
+                agent_message = _build_structured_message(text, s3_key, content_type, filename)
+            else:
+                send_slack_message(channel_id, "Sorry, I couldn't process that document. Please try again.", bot_token)
+                return {"statusCode": 200, "body": "ok"}
+        else:
+            send_slack_message(channel_id, "Sorry, I couldn't download that document. Please try again.", bot_token)
+            return {"statusCode": 200, "body": "ok"}
 
     # Get or create session
     session_id = get_or_create_session(resolved_user_id)
 
     logger.info(
-        "Slack: user=%s actor=%s session=%s msg_len=%d has_image=%s",
-        resolved_user_id, actor_id, session_id, len(text), has_image,
+        "Slack: user=%s actor=%s session=%s msg_len=%d has_file=%s",
+        resolved_user_id, actor_id, session_id, len(text), has_file,
     )
 
     # Invoke AgentCore with progress notification for long requests

@@ -440,6 +440,131 @@ async function fetchImageFromS3(s3Key, expectedNamespace) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Document support — extract markers, fetch from S3, build document content
+// ---------------------------------------------------------------------------
+
+const ALLOWED_DOCUMENT_TYPES = new Set([
+  "application/pdf",
+  "text/csv",
+  "text/plain",
+  "application/json",
+  "text/markdown",
+  "text/html",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+]);
+const CONTENT_TYPE_TO_BEDROCK_DOC_FORMAT = {
+  "application/pdf": "pdf",
+  "text/csv": "csv",
+  "text/plain": "txt",
+  "application/json": "json",
+  "text/markdown": "md",
+  "text/html": "html",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+};
+const VALID_BEDROCK_DOC_FORMATS = new Set([
+  "pdf", "csv", "doc", "docx", "xls", "xlsx", "html", "txt", "md",
+]);
+const DOCUMENT_MARKER_REGEX = /\n?\n?\[OPENCLAW_DOCUMENTS:(\[.*?\])\]\s*$/;
+const MAX_DOCUMENT_BYTES = 4_500_000; // 4.5 MB — Bedrock document limit
+
+/**
+ * Extract document references from text that contains the [OPENCLAW_DOCUMENTS:...] marker.
+ * Returns { cleanText, documents } where documents is an array of { s3Key, contentType, name }.
+ */
+function extractDocumentReferences(text) {
+  if (typeof text !== "string") return { cleanText: text, documents: [] };
+
+  const match = text.match(DOCUMENT_MARKER_REGEX);
+  if (!match) return { cleanText: text, documents: [] };
+
+  const cleanText = text.slice(0, match.index).trimEnd();
+  try {
+    const documents = JSON.parse(match[1]);
+    if (!Array.isArray(documents)) return { cleanText, documents: [] };
+    const validDocs = documents.filter(
+      (doc) =>
+        doc.s3Key &&
+        doc.contentType &&
+        ALLOWED_DOCUMENT_TYPES.has(doc.contentType),
+    );
+    return { cleanText, documents: validDocs };
+  } catch {
+    return { cleanText, documents: [] };
+  }
+}
+
+/**
+ * Fetch a document from S3 by key. Returns { bytes: Buffer, format: string, name: string } or null.
+ * Validates that the key belongs to the expected user namespace and contains no
+ * path traversal sequences.
+ */
+async function fetchDocumentFromS3(s3Key, expectedNamespace, docName) {
+  if (s3Key.includes("..")) {
+    console.warn(`[proxy] Rejected S3 document key with path traversal: ${s3Key}`);
+    return null;
+  }
+
+  const expectedPrefix = expectedNamespace + "/_uploads/";
+  if (!s3Key.startsWith(expectedPrefix)) {
+    console.warn(
+      `[proxy] Rejected S3 document key outside user namespace: ${s3Key} (expected prefix: ${expectedPrefix})`,
+    );
+    return null;
+  }
+
+  const bucket = process.env.S3_USER_FILES_BUCKET;
+  if (!bucket) {
+    console.warn("[proxy] S3_USER_FILES_BUCKET not configured — cannot fetch document");
+    return null;
+  }
+
+  try {
+    const { GetObjectCommand } = require("@aws-sdk/client-s3");
+    const s3 = getS3Client();
+    const resp = await s3.send(
+      new GetObjectCommand({ Bucket: bucket, Key: s3Key }),
+    );
+    const chunks = [];
+    for await (const chunk of resp.Body) {
+      chunks.push(chunk);
+    }
+    const bytes = Buffer.concat(chunks);
+
+    if (bytes.length > MAX_DOCUMENT_BYTES) {
+      console.warn(
+        `[proxy] S3 document too large: ${bytes.length} bytes (key=${s3Key})`,
+      );
+      return null;
+    }
+
+    const contentType = resp.ContentType || "";
+    const rawFormat =
+      CONTENT_TYPE_TO_BEDROCK_DOC_FORMAT[contentType] ||
+      (s3Key.includes(".") ? s3Key.split(".").pop().toLowerCase() : null);
+    const format =
+      rawFormat && VALID_BEDROCK_DOC_FORMATS.has(rawFormat) ? rawFormat : "txt";
+
+    // Build a safe document name from the original filename or S3 key
+    const name = (docName || s3Key.split("/").pop() || "document")
+      .replace(/[^a-zA-Z0-9_\-. ]/g, "_")
+      .replace(/\.([^.]+)$/, "")  // strip extension (Bedrock uses format field)
+      .slice(0, 200) || "document";
+
+    console.log(
+      `[proxy] Fetched document from S3: ${s3Key} (${bytes.length} bytes, format=${format})`,
+    );
+    return { bytes, format, name };
+  } catch (err) {
+    console.error(
+      `[proxy] Failed to fetch document from S3: ${s3Key} — ${err.message}`,
+    );
+    return null;
+  }
+}
+
 // Workspace files pre-loaded into system prompt per user (priority order)
 const WORKSPACE_FILES = [
   {
@@ -912,7 +1037,7 @@ function convertMessages(messages) {
     if (msg.role === "system") continue;
 
     if (msg.role === "user") {
-      // Handle multimodal content (array with text + image_bedrock parts)
+      // Handle multimodal content (array with text + image_bedrock + document_bedrock parts)
       if (Array.isArray(msg.content)) {
         const bedrockContent = [];
         for (const part of msg.content) {
@@ -920,6 +1045,8 @@ function convertMessages(messages) {
             bedrockContent.push({ text: part.text });
           } else if (part.type === "image_bedrock" && part.image) {
             bedrockContent.push({ image: part.image });
+          } else if (part.type === "document_bedrock" && part.document) {
+            bedrockContent.push({ document: part.document });
           }
         }
         if (bedrockContent.length > 0) {
@@ -1451,7 +1578,7 @@ const server = http.createServer(async (req, res) => {
           );
         }
 
-        // --- Preprocess images: extract markers from last user message ---
+        // --- Preprocess files: extract image/document markers from last user message ---
         let processedMessages = messages;
         const namespace = actorId.replace(/:/g, "_");
         const lastUserIdx = messages.reduce(
@@ -1469,10 +1596,14 @@ const server = http.createServer(async (req, res) => {
                     .map((p) => p.text)
                     .join("")
                 : "";
-          const { cleanText, images } = extractImageReferences(textContent);
-          if (images.length > 0) {
+
+          // Extract image markers first, then document markers from the cleaned text
+          const { cleanText: afterImages, images } = extractImageReferences(textContent);
+          const { cleanText, documents } = extractDocumentReferences(afterImages);
+
+          if (images.length > 0 || documents.length > 0) {
             console.log(
-              `[proxy] Found ${images.length} image reference(s) in last user message`,
+              `[proxy] Found ${images.length} image(s) and ${documents.length} document(s) in last user message`,
             );
             const contentParts = [];
             if (cleanText) {
@@ -1494,7 +1625,24 @@ const server = http.createServer(async (req, res) => {
                 );
               }
             }
-            // Fall back to original message if all images failed and no text
+            for (const doc of documents) {
+              const fetched = await fetchDocumentFromS3(doc.s3Key, namespace, doc.name);
+              if (fetched) {
+                contentParts.push({
+                  type: "document_bedrock",
+                  document: {
+                    format: fetched.format,
+                    name: fetched.name,
+                    source: { bytes: fetched.bytes },
+                  },
+                });
+              } else {
+                console.warn(
+                  `[proxy] Skipping unfetchable document: ${doc.s3Key}`,
+                );
+              }
+            }
+            // Fall back to original message if all files failed and no text
             if (contentParts.length > 0) {
               // Build new messages array (immutable — don't mutate original)
               processedMessages = [
@@ -1504,7 +1652,7 @@ const server = http.createServer(async (req, res) => {
               ];
             } else {
               console.warn(
-                "[proxy] All images failed to fetch and no text — using original message",
+                "[proxy] All files failed to fetch and no text — using original message",
               );
             }
           }

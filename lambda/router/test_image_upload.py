@@ -284,5 +284,244 @@ class TestHandleTelegramWithImages(unittest.TestCase):
         self.assertEqual(msg, "Hello")
 
 
+class TestUploadDocumentToS3(unittest.TestCase):
+    """Tests for _upload_document_to_s3."""
+
+    def setUp(self):
+        self.original_bucket = index.USER_FILES_BUCKET
+        index.USER_FILES_BUCKET = "test-bucket"
+
+    def tearDown(self):
+        index.USER_FILES_BUCKET = self.original_bucket
+
+    @patch.object(index, "s3_client")
+    def test_valid_pdf_upload(self, mock_s3):
+        """Valid PDF upload returns an S3 key."""
+        pdf_bytes = b"%PDF-1.4" + b"\x00" * 100
+        result = index._upload_document_to_s3(pdf_bytes, "telegram_123", "application/pdf")
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.startswith("telegram_123/_uploads/doc_"))
+        self.assertTrue(result.endswith(".pdf"))
+        mock_s3.put_object.assert_called_once()
+
+    @patch.object(index, "s3_client")
+    def test_valid_csv_upload(self, mock_s3):
+        """Valid CSV upload returns an S3 key."""
+        csv_bytes = b"name,age\nAlice,30\n"
+        result = index._upload_document_to_s3(csv_bytes, "slack_U123", "text/csv")
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.endswith(".csv"))
+
+    def test_invalid_content_type(self):
+        """Non-document content type is rejected."""
+        result = index._upload_document_to_s3(b"data", "ns", "image/jpeg")
+        self.assertIsNone(result)
+
+    def test_oversized_document(self):
+        """Document exceeding 4.5 MB is rejected."""
+        big = b"\x00" * (4_500_001)
+        result = index._upload_document_to_s3(big, "ns", "application/pdf")
+        self.assertIsNone(result)
+
+    def test_no_bucket_configured(self):
+        """Returns None when USER_FILES_BUCKET is empty."""
+        index.USER_FILES_BUCKET = ""
+        result = index._upload_document_to_s3(b"data", "ns", "application/pdf")
+        self.assertIsNone(result)
+
+    @patch.object(index, "s3_client")
+    def test_s3_error(self, mock_s3):
+        """Returns None when S3 put_object fails."""
+        mock_s3.put_object.side_effect = Exception("S3 error")
+        result = index._upload_document_to_s3(b"data", "ns", "application/pdf")
+        self.assertIsNone(result)
+
+    @patch.object(index, "s3_client")
+    def test_docx_upload(self, mock_s3):
+        """DOCX upload returns correct extension."""
+        result = index._upload_document_to_s3(
+            b"PK\x03\x04" + b"\x00" * 100, "ns",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        self.assertIsNotNone(result)
+        self.assertTrue(result.endswith(".docx"))
+
+
+class TestDownloadTelegramDocument(unittest.TestCase):
+    """Tests for _download_telegram_document."""
+
+    @patch("index.urllib_request")
+    def test_pdf_document_download(self, mock_urllib):
+        """Downloads a PDF document from Telegram."""
+        message = {
+            "document": {
+                "file_id": "doc_pdf",
+                "mime_type": "application/pdf",
+                "file_name": "report.pdf",
+            }
+        }
+
+        get_file_resp = MagicMock()
+        get_file_resp.read.return_value = json.dumps({
+            "ok": True,
+            "result": {"file_path": "documents/report.pdf", "file_size": 50000},
+        }).encode()
+
+        download_resp = MagicMock()
+        download_resp.read.return_value = b"%PDF-1.4" + b"\x00" * 100
+
+        mock_urllib.urlopen.side_effect = [get_file_resp, download_resp]
+
+        doc_bytes, content_type, filename = index._download_telegram_document(message, "test-token")
+        self.assertIsNotNone(doc_bytes)
+        self.assertEqual(content_type, "application/pdf")
+        self.assertEqual(filename, "report.pdf")
+
+    def test_image_mime_rejected(self):
+        """Rejects document with image MIME type (handled by _download_telegram_image)."""
+        message = {"document": {"file_id": "doc", "mime_type": "image/jpeg"}}
+        result = index._download_telegram_document(message, "test-token")
+        self.assertEqual(result, (None, None, None))
+
+    def test_no_document_in_message(self):
+        """Returns None tuple when message has no document."""
+        message = {"text": "Hello"}
+        result = index._download_telegram_document(message, "test-token")
+        self.assertEqual(result, (None, None, None))
+
+    def test_unsupported_mime_rejected(self):
+        """Rejects document with unsupported MIME type."""
+        message = {"document": {"file_id": "doc", "mime_type": "application/zip"}}
+        result = index._download_telegram_document(message, "test-token")
+        self.assertEqual(result, (None, None, None))
+
+    @patch("index.urllib_request")
+    def test_oversized_document_rejected(self, mock_urllib):
+        """Rejects documents that exceed the size limit."""
+        message = {"document": {"file_id": "big_doc", "mime_type": "application/pdf", "file_name": "big.pdf"}}
+
+        get_file_resp = MagicMock()
+        get_file_resp.read.return_value = json.dumps({
+            "ok": True,
+            "result": {"file_path": "documents/big.pdf", "file_size": 5_000_000},
+        }).encode()
+        mock_urllib.urlopen.return_value = get_file_resp
+
+        result = index._download_telegram_document(message, "test-token")
+        self.assertEqual(result, (None, None, None))
+
+
+class TestDownloadSlackFileDocuments(unittest.TestCase):
+    """Tests for _download_slack_file with document types."""
+
+    @patch("index.urllib_request")
+    def test_pdf_download(self, mock_urllib):
+        """Downloads a PDF file from Slack."""
+        file_info = {
+            "mimetype": "application/pdf",
+            "size": 50000,
+            "url_private_download": "https://files.slack.com/files-pri/T0/report.pdf",
+            "name": "report.pdf",
+        }
+
+        download_resp = MagicMock()
+        download_resp.read.return_value = b"%PDF-1.4" + b"\x00" * 100
+        mock_urllib.urlopen.return_value = download_resp
+        mock_urllib.Request = MagicMock(return_value=MagicMock())
+
+        doc_bytes, content_type, filename = index._download_slack_file(file_info, "xoxb-token")
+
+        self.assertIsNotNone(doc_bytes)
+        self.assertEqual(content_type, "application/pdf")
+        self.assertEqual(filename, "report.pdf")
+
+    def test_unsupported_type_rejected(self):
+        """Rejects unsupported MIME types."""
+        file_info = {"mimetype": "application/zip", "size": 100}
+        result = index._download_slack_file(file_info, "xoxb-token")
+        self.assertEqual(result, (None, None, None))
+
+    def test_oversized_document_rejected(self):
+        """Rejects documents exceeding document size limit."""
+        file_info = {"mimetype": "application/pdf", "size": 5_000_000}
+        result = index._download_slack_file(file_info, "xoxb-token")
+        self.assertEqual(result, (None, None, None))
+
+    def test_image_still_uses_image_limit(self):
+        """Image files still use the image size limit (3.75 MB)."""
+        file_info = {"mimetype": "image/png", "size": 4_000_000}
+        result = index._download_slack_file(file_info, "xoxb-token")
+        self.assertEqual(result, (None, None, None))
+
+
+class TestBuildStructuredMessageDocuments(unittest.TestCase):
+    """Tests for _build_structured_message with documents."""
+
+    def test_with_pdf_document(self):
+        """Builds message with document reference for PDF."""
+        result = index._build_structured_message(
+            "Analyze this", "ns/_uploads/doc.pdf", "application/pdf", "report.pdf"
+        )
+        self.assertEqual(result["text"], "Analyze this")
+        self.assertNotIn("images", result)
+        self.assertEqual(len(result["documents"]), 1)
+        self.assertEqual(result["documents"][0]["s3Key"], "ns/_uploads/doc.pdf")
+        self.assertEqual(result["documents"][0]["contentType"], "application/pdf")
+        self.assertEqual(result["documents"][0]["name"], "report.pdf")
+
+    def test_image_still_uses_images_key(self):
+        """Image content type still uses 'images' key."""
+        result = index._build_structured_message("Look", "ns/_uploads/img.jpeg", "image/jpeg")
+        self.assertIn("images", result)
+        self.assertNotIn("documents", result)
+
+    def test_document_without_filename(self):
+        """Document without filename omits name field."""
+        result = index._build_structured_message("Check this", "ns/_uploads/doc.csv", "text/csv")
+        self.assertEqual(len(result["documents"]), 1)
+        self.assertNotIn("name", result["documents"][0])
+
+
+class TestHandleTelegramWithDocuments(unittest.TestCase):
+    """Integration tests for handle_telegram with document support."""
+
+    @patch.object(index, "invoke_agent_runtime", return_value={"response": "I see a PDF!"})
+    @patch.object(index, "get_or_create_session", return_value="ses_test_123456789012345678")
+    @patch.object(index, "resolve_user", return_value=("user_test123", False))
+    @patch.object(index, "send_telegram_typing")
+    @patch.object(index, "send_telegram_message")
+    @patch.object(index, "_upload_document_to_s3", return_value="telegram_123/_uploads/doc_test.pdf")
+    @patch.object(index, "_download_telegram_document", return_value=(b"pdf_data", "application/pdf", "report.pdf"))
+    @patch.object(index, "_get_telegram_token", return_value="test-token")
+    def test_pdf_document_message(self, mock_token, mock_download, mock_upload,
+                                   mock_send, mock_typing, mock_resolve, mock_session, mock_invoke):
+        """PDF document message triggers document download, upload, and structured message."""
+        body = json.dumps({
+            "message": {
+                "chat": {"id": 123},
+                "from": {"id": 456, "first_name": "Test"},
+                "document": {
+                    "file_id": "abc",
+                    "mime_type": "application/pdf",
+                    "file_name": "report.pdf",
+                },
+                "caption": "What's in this PDF?",
+            }
+        })
+
+        index.handle_telegram(body)
+
+        mock_download.assert_called_once()
+        mock_upload.assert_called_once()
+        call_args = mock_invoke.call_args
+        msg = call_args[0][4]
+        self.assertIsInstance(msg, dict)
+        self.assertEqual(msg["text"], "What's in this PDF?")
+        self.assertEqual(len(msg["documents"]), 1)
+        self.assertEqual(msg["documents"][0]["contentType"], "application/pdf")
+
+
 if __name__ == "__main__":
     unittest.main()

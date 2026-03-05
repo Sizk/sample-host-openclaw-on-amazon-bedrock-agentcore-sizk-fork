@@ -126,6 +126,8 @@ function convertMessages(messages) {
             bedrockContent.push({ text: part.text });
           } else if (part.type === "image_bedrock" && part.image) {
             bedrockContent.push({ image: part.image });
+          } else if (part.type === "document_bedrock" && part.document) {
+            bedrockContent.push({ document: part.document });
           }
         }
         if (bedrockContent.length > 0) {
@@ -236,6 +238,255 @@ describe("convertMessages with multimodal content", () => {
     const { bedrockMessages } = convertMessages(messages);
     assert.equal(bedrockMessages[0].content.length, 1);
     assert.equal(bedrockMessages[0].content[0].text, "Hello");
+  });
+});
+
+// --- extractDocumentReferences ---
+
+const ALLOWED_DOCUMENT_TYPES = new Set([
+  "application/pdf",
+  "text/csv",
+  "text/plain",
+  "application/json",
+  "text/markdown",
+  "text/html",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+]);
+const DOCUMENT_MARKER_REGEX = /\n?\n?\[OPENCLAW_DOCUMENTS:(\[.*?\])\]\s*$/;
+
+function extractDocumentReferences(text) {
+  if (typeof text !== "string") return { cleanText: text, documents: [] };
+
+  const match = text.match(DOCUMENT_MARKER_REGEX);
+  if (!match) return { cleanText: text, documents: [] };
+
+  const cleanText = text.slice(0, match.index).trimEnd();
+  try {
+    const documents = JSON.parse(match[1]);
+    if (!Array.isArray(documents)) return { cleanText, documents: [] };
+    const validDocs = documents.filter(
+      (doc) =>
+        doc.s3Key &&
+        doc.contentType &&
+        ALLOWED_DOCUMENT_TYPES.has(doc.contentType),
+    );
+    return { cleanText, documents: validDocs };
+  } catch {
+    return { cleanText, documents: [] };
+  }
+}
+
+describe("extractDocumentReferences", () => {
+  it("returns original text when no marker present", () => {
+    const result = extractDocumentReferences("Hello, how are you?");
+    assert.equal(result.cleanText, "Hello, how are you?");
+    assert.equal(result.documents.length, 0);
+  });
+
+  it("extracts single PDF document reference", () => {
+    const text =
+      'Analyze this\n\n[OPENCLAW_DOCUMENTS:[{"s3Key":"ns/_uploads/doc_123.pdf","contentType":"application/pdf","name":"report.pdf"}]]';
+    const result = extractDocumentReferences(text);
+    assert.equal(result.cleanText, "Analyze this");
+    assert.equal(result.documents.length, 1);
+    assert.equal(result.documents[0].s3Key, "ns/_uploads/doc_123.pdf");
+    assert.equal(result.documents[0].contentType, "application/pdf");
+    assert.equal(result.documents[0].name, "report.pdf");
+  });
+
+  it("handles empty text with document only", () => {
+    const text =
+      '\n\n[OPENCLAW_DOCUMENTS:[{"s3Key":"ns/_uploads/doc.csv","contentType":"text/csv"}]]';
+    const result = extractDocumentReferences(text);
+    assert.equal(result.cleanText, "");
+    assert.equal(result.documents.length, 1);
+  });
+
+  it("handles invalid JSON gracefully", () => {
+    const text = "Hello\n\n[OPENCLAW_DOCUMENTS:[not valid json]]";
+    const result = extractDocumentReferences(text);
+    assert.equal(result.cleanText, "Hello");
+    assert.equal(result.documents.length, 0);
+  });
+
+  it("rejects disallowed content types", () => {
+    const text =
+      'Check\n\n[OPENCLAW_DOCUMENTS:[{"s3Key":"ns/_uploads/file.exe","contentType":"application/octet-stream"}]]';
+    const result = extractDocumentReferences(text);
+    assert.equal(result.cleanText, "Check");
+    assert.equal(result.documents.length, 0);
+  });
+
+  it("handles non-string input", () => {
+    const result = extractDocumentReferences(42);
+    assert.equal(result.cleanText, 42);
+    assert.equal(result.documents.length, 0);
+  });
+
+  it("handles trailing whitespace after marker", () => {
+    const text =
+      'Look\n\n[OPENCLAW_DOCUMENTS:[{"s3Key":"ns/_uploads/doc.pdf","contentType":"application/pdf"}]]  \n';
+    const result = extractDocumentReferences(text);
+    assert.equal(result.cleanText, "Look");
+    assert.equal(result.documents.length, 1);
+  });
+
+  it("filters out entries missing s3Key", () => {
+    const text =
+      'Hi\n\n[OPENCLAW_DOCUMENTS:[{"contentType":"application/pdf"},{"s3Key":"ns/_uploads/doc.pdf","contentType":"application/pdf"}]]';
+    const result = extractDocumentReferences(text);
+    assert.equal(result.documents.length, 1);
+    assert.equal(result.documents[0].s3Key, "ns/_uploads/doc.pdf");
+  });
+
+  it("accepts all supported document types", () => {
+    const types = [
+      "application/pdf", "text/csv", "text/plain", "application/json",
+      "text/markdown", "text/html",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ];
+    for (const ct of types) {
+      const text = `test\n\n[OPENCLAW_DOCUMENTS:[{"s3Key":"ns/_uploads/doc","contentType":"${ct}"}]]`;
+      const result = extractDocumentReferences(text);
+      assert.equal(result.documents.length, 1, `Expected ${ct} to be accepted`);
+    }
+  });
+});
+
+// --- Combined image + document extraction ---
+
+describe("combined image and document extraction", () => {
+  it("extracts documents after images when both markers present", () => {
+    const text =
+      'Check both\n\n[OPENCLAW_IMAGES:[{"s3Key":"ns/_uploads/img.jpeg","contentType":"image/jpeg"}]]\n\n[OPENCLAW_DOCUMENTS:[{"s3Key":"ns/_uploads/doc.pdf","contentType":"application/pdf"}]]';
+
+    // Extract images first
+    const imgResult = extractImageReferences(text);
+    assert.equal(imgResult.images.length, 0); // images marker is not at end
+
+    // Extract documents (at end)
+    const docResult = extractDocumentReferences(text);
+    assert.equal(docResult.documents.length, 1);
+  });
+
+  it("handles text with only image marker", () => {
+    const text =
+      'Look\n\n[OPENCLAW_IMAGES:[{"s3Key":"ns/_uploads/img.jpeg","contentType":"image/jpeg"}]]';
+    const docResult = extractDocumentReferences(text);
+    assert.equal(docResult.documents.length, 0);
+    assert.equal(docResult.cleanText, text);
+  });
+});
+
+// --- convertMessages with document content ---
+
+describe("convertMessages with document content", () => {
+  it("converts array content with text and document parts", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Analyze this PDF" },
+          {
+            type: "document_bedrock",
+            document: {
+              format: "pdf",
+              name: "report",
+              source: { bytes: Buffer.from("fake-pdf") },
+            },
+          },
+        ],
+      },
+    ];
+    const { bedrockMessages } = convertMessages(messages);
+    assert.equal(bedrockMessages.length, 1);
+    assert.equal(bedrockMessages[0].content.length, 2);
+    assert.equal(bedrockMessages[0].content[0].text, "Analyze this PDF");
+    assert.ok(bedrockMessages[0].content[1].document);
+    assert.equal(bedrockMessages[0].content[1].document.format, "pdf");
+    assert.equal(bedrockMessages[0].content[1].document.name, "report");
+  });
+
+  it("handles document-only message (no text)", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [
+          {
+            type: "document_bedrock",
+            document: {
+              format: "csv",
+              name: "data",
+              source: { bytes: Buffer.from("a,b\n1,2") },
+            },
+          },
+        ],
+      },
+    ];
+    const { bedrockMessages } = convertMessages(messages);
+    assert.equal(bedrockMessages.length, 1);
+    assert.equal(bedrockMessages[0].content.length, 1);
+    assert.ok(bedrockMessages[0].content[0].document);
+  });
+
+  it("converts mixed content with text, image, and document", () => {
+    const messages = [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Compare these" },
+          {
+            type: "image_bedrock",
+            image: { format: "jpeg", source: { bytes: Buffer.from("img") } },
+          },
+          {
+            type: "document_bedrock",
+            document: {
+              format: "pdf",
+              name: "doc",
+              source: { bytes: Buffer.from("pdf") },
+            },
+          },
+        ],
+      },
+    ];
+    const { bedrockMessages } = convertMessages(messages);
+    assert.equal(bedrockMessages[0].content.length, 3);
+    assert.ok(bedrockMessages[0].content[0].text);
+    assert.ok(bedrockMessages[0].content[1].image);
+    assert.ok(bedrockMessages[0].content[2].document);
+  });
+});
+
+// --- fetchDocumentFromS3 key validation (namespace-aware) ---
+
+describe("fetchDocumentFromS3 key validation", () => {
+  const namespace = "telegram_123";
+
+  it("accepts keys in the correct user namespace", () => {
+    const key = "telegram_123/_uploads/doc_1234_abcd.pdf";
+    const expectedPrefix = namespace + "/_uploads/";
+    assert.ok(key.startsWith(expectedPrefix));
+    assert.ok(!key.includes(".."));
+  });
+
+  it("rejects keys from a different user namespace", () => {
+    const key = "telegram_999/_uploads/doc_1234_abcd.pdf";
+    const expectedPrefix = namespace + "/_uploads/";
+    assert.ok(!key.startsWith(expectedPrefix));
+  });
+
+  it("rejects keys with path traversal", () => {
+    const key = "telegram_123/_uploads/../../other_user/_uploads/doc.pdf";
+    assert.ok(key.includes(".."));
+  });
+
+  it("rejects keys without /_uploads/ segment", () => {
+    const key = "telegram_123/regular-file.pdf";
+    const expectedPrefix = namespace + "/_uploads/";
+    assert.ok(!key.startsWith(expectedPrefix));
   });
 });
 
