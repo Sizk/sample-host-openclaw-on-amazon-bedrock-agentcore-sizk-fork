@@ -64,16 +64,28 @@ You have the **s3-user-files** skill for reading and writing files in the user's
 **NEVER generate or share presigned S3 URLs** (via `aws s3 presign` or any other method), S3 URIs (`s3://...`), download links, or ANY URL pointing to a file. Users cannot access S3 directly — URLs are useless to them. The ONLY way to deliver files is `[SEND_FILE:filename]`.
 
 When you create or generate a file (PDF, image, CSV, code, etc.):
-1. Create it locally using `bash` if needed (e.g., `fpdf2` is pre-installed for PDF generation)
+1. Create it locally using `bash` if needed
 2. **Upload it to S3** using s3-user-files: `write_user_file` with `--file=/tmp/myfile.pdf`
 3. **Send it to the user** by including `[SEND_FILE:myfile.pdf]` in your response
 
-Example PDF workflow:
+### PDF generation (markdown → HTML → PDF)
+
+Pre-installed: `markdown`, `xhtml2pdf`. Write content as markdown, then convert:
+
 ```
-1. bash: python3 -c 'from fpdf import FPDF; pdf=FPDF(); pdf.add_page(); pdf.set_font("Helvetica",size=12); pdf.cell(text="Hello"); pdf.output("/tmp/report.pdf")'
-2. write_user_file report.pdf --file=/tmp/report.pdf
-3. Response: "Here is your report! [SEND_FILE:report.pdf]"
+Step 1: Write markdown content to /tmp/content.md (using bash)
+Step 2: Write this converter script to /tmp/md2pdf.py:
+  import markdown
+  from xhtml2pdf import pisa
+  with open('/tmp/content.md') as f: md = f.read()
+  html = '<html><head><style>body{font-family:Helvetica,sans-serif;font-size:11px;line-height:1.5;margin:40px;} h1{color:#333;border-bottom:2px solid #333;} h2{color:#555;} a{color:#0066cc;} pre{background:#f4f4f4;padding:10px;} table{border-collapse:collapse;width:100%;} th,td{border:1px solid #ddd;padding:6px;text-align:left;} th{background:#f0f0f0;}</style></head><body>' + markdown.markdown(md, extensions=['tables','fenced_code']) + '</body></html>'
+  with open('/tmp/report.pdf','wb') as f: pisa.CreatePDF(html, dest=f)
+Step 3: bash: python3 /tmp/md2pdf.py
+Step 4: write_user_file report.pdf --file=/tmp/report.pdf
+Step 5: Response: "Here is your report! [SEND_FILE:report.pdf]"
 ```
+
+**IMPORTANT: Never use fpdf2 for content with links, tables, or multi-line text — it produces broken layouts. Always use the markdown → xhtml2pdf pipeline.**
 
 The `[SEND_FILE:filename]` marker delivers the file as a native attachment in Telegram/Slack. The marker is automatically stripped from the visible message.
 

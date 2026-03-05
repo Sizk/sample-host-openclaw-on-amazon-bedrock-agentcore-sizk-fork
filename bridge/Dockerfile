@@ -8,8 +8,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl jq git python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# Install AWS CLI and PDF generation library (fpdf2 — lightweight, pure Python)
-RUN pip3 install --no-cache-dir --break-system-packages awscli fpdf2
+# Install AWS CLI and PDF generation: xhtml2pdf renders HTML→PDF, markdown converts MD→HTML
+RUN pip3 install --no-cache-dir --break-system-packages awscli fpdf2 xhtml2pdf markdown
 
 # Install OpenClaw and ClawHub CLI globally
 RUN npm install -g openclaw@latest clawhub@latest
