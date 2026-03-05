@@ -9,8 +9,13 @@ RUN apt-get update && \
         gcc pkg-config libcairo2-dev python3-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Install AWS CLI and PDF generation: xhtml2pdf renders HTML→PDF, markdown converts MD→HTML
-RUN pip3 install --no-cache-dir --break-system-packages awscli fpdf2 xhtml2pdf markdown
+# Install AWS CLI and file generation libraries
+# PDF: xhtml2pdf (HTML→PDF), markdown (MD→HTML), fpdf2 (simple PDFs)
+# Charts/Images: matplotlib, pillow
+# Other: qrcode (QR codes), icalendar (ICS calendar files)
+RUN pip3 install --no-cache-dir --break-system-packages \
+    awscli fpdf2 xhtml2pdf markdown \
+    matplotlib pillow qrcode icalendar
 
 # Install OpenClaw and ClawHub CLI globally
 RUN npm install -g openclaw@latest clawhub@latest
