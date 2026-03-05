@@ -8,8 +8,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends curl jq git python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
-# Install AWS CLI (for Secrets Manager in entrypoint)
-RUN pip3 install --no-cache-dir --break-system-packages awscli
+# Install AWS CLI and PDF generation library (fpdf2 — lightweight, pure Python)
+RUN pip3 install --no-cache-dir --break-system-packages awscli fpdf2
 
 # Install OpenClaw and ClawHub CLI globally
 RUN npm install -g openclaw@latest clawhub@latest
@@ -62,9 +62,9 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim
 
-# Install only runtime system dependencies (no git, no pip, no build tools)
+# Install runtime system dependencies (pip3 lets the agent install Python packages on demand)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq python3 && \
+    apt-get install -y --no-install-recommends curl jq python3 python3-pip && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy AWS CLI from builder
