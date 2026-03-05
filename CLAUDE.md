@@ -177,7 +177,7 @@ cdk destroy --all                            # tear down
 ### Build & Push Bridge Image (after CDK deploy creates ECR repo)
 ```bash
 export CDK_DEFAULT_ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-export CDK_DEFAULT_REGION=us-west-2  # change to your preferred region
+export CDK_DEFAULT_REGION=eu-west-1
 
 aws ecr get-login-password --region $CDK_DEFAULT_REGION | \
   docker login --username AWS --password-stdin \
@@ -297,7 +297,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
 | Parameter | Default | Description |
 |---|---|---|
 | `account` | (empty) | AWS account ID. Falls back to `CDK_DEFAULT_ACCOUNT` |
-| `region` | `us-west-2` | AWS region. Falls back to `CDK_DEFAULT_REGION` |
+| `region` | `eu-west-1` | AWS region. Falls back to `CDK_DEFAULT_REGION` |
 | `default_model_id` | `global.anthropic.claude-opus-4-6-v1` | Bedrock model ID. The `global.` prefix routes to any available region |
 | `image_version` | `1` | Bridge container version tag. Bump to force container redeploy |
 | `cloudwatch_log_retention_days` | `30` | Log retention |
@@ -508,7 +508,7 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 Always confirm which git branch you are on BEFORE making any code changes or deployments. If the user specifies a branch, switch to it first and verify with `git branch --show-current`. Never assume the current branch is correct.
 
 ### Deployment Target
-Default deployment region is `ap-southeast-2`. Always use this region for ECR, CDK, and Docker operations unless explicitly told otherwise. After deploying, verify the old session/container is replaced — stale sessions can mask fixes.
+Default deployment region is `eu-west-1`. This is the ONLY region used in this project — never deploy to any other region. Always use `eu-west-1` for ECR, CDK, CodeBuild, and all AWS operations. Use `./scripts/codebuild-push.sh` to build and push the bridge container image remotely via CodeBuild (no local Docker required). After deploying, verify the old session/container is replaced — stale sessions can mask fixes.
 
 ### Git Operations
 Never push to any remote (GitHub, GitLab, or otherwise) without explicit user confirmation. Always ask before pushing.
