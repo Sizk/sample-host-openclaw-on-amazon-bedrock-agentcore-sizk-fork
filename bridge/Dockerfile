@@ -3,9 +3,10 @@
 # ============================================================
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim AS builder
 
-# Install system dependencies
+# Install system dependencies (gcc + cairo dev libs needed to compile pycairo for xhtml2pdf)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq git python3 python3-pip && \
+    apt-get install -y --no-install-recommends curl jq git python3 python3-pip \
+        gcc pkg-config libcairo2-dev python3-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Install AWS CLI and PDF generation: xhtml2pdf renders HTML→PDF, markdown converts MD→HTML
@@ -62,9 +63,9 @@ RUN mkdir -p /app/.compile-cache && \
 # ============================================================
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim
 
-# Install runtime system dependencies (pip3 lets the agent install Python packages on demand)
+# Install runtime system dependencies (pip3 for on-demand installs, libcairo2 for xhtml2pdf/pycairo)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq python3 python3-pip && \
+    apt-get install -y --no-install-recommends curl jq python3 python3-pip libcairo2 && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy AWS CLI from builder
