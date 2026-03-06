@@ -15,7 +15,6 @@ import json
 import logging
 import os
 import re
-import threading
 import time
 import uuid
 from urllib import request as urllib_request
@@ -659,29 +658,6 @@ def send_telegram_typing(chat_id, token):
         pass
 
 
-def _periodic_typing(chat_id, token, stop_event, interval=4, notify_after_s=30):
-    """Send typing indicator every `interval` seconds until stop_event is set.
-
-    Runs in a background thread. Telegram typing indicators expire after ~5s,
-    so we send every 4s to keep the indicator visible during long AgentCore calls.
-
-    After `notify_after_s` seconds, sends a one-time progress message so the user
-    knows the bot is still working (e.g. during subagent tasks).
-    """
-    notified = False
-    elapsed = 0
-    while not stop_event.wait(timeout=interval):
-        elapsed += interval
-        send_telegram_typing(chat_id, token)
-        if not notified and elapsed >= notify_after_s:
-            send_telegram_message(
-                chat_id,
-                "\u23f3 Working on your request \u2014 this may take a few minutes. "
-                "I'll send the full response when it's ready.",
-                token,
-            )
-            notified = True
-
 
 def send_slack_message(channel_id, text, bot_token):
     """Send a message via Slack Web API."""
@@ -828,17 +804,6 @@ def _send_response_files(files, channel_type, chat_id, token_or_bot_token):
             send_telegram_document(chat_id, file_bytes, filename, token_or_bot_token)
         elif channel_type == "slack":
             send_slack_file(chat_id, file_bytes, filename, token_or_bot_token)
-
-
-def _slack_progress_notify(channel_id, bot_token, stop_event, notify_after_s=30):
-    """Send a one-time progress message to Slack if the request takes longer than notify_after_s."""
-    if not stop_event.wait(timeout=notify_after_s):
-        send_slack_message(
-            channel_id,
-            "\u23f3 Working on your request \u2014 this may take a few minutes. "
-            "I'll send the full response when it's ready.",
-            bot_token,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1283,8 +1248,18 @@ def _dispatch_media_group(record):
     chat_id = record.get("chatId", "")
     channel = record.get("channel", "telegram")
 
-    if not images or not user_id or not actor_id or not chat_id:
+    if not user_id or not actor_id or not chat_id:
         logger.error("Media group dispatch: missing required fields")
+        return
+
+    if not images:
+        logger.error("Media group dispatch: no images collected — notifying user")
+        token = _get_telegram_token()
+        send_telegram_message(
+            int(chat_id),
+            "Sorry, I couldn't process your images. Please try sending them again.",
+            token,
+        )
         return
 
     agent_message = _build_multi_image_message(caption, images)

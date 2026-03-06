@@ -10,8 +10,11 @@ OpenClaw on AgentCore Runtime — a multi-channel AI messaging bot (Telegram, Sl
 
 - **Infrastructure**: CDK v2 (Python), 7 stacks
 - **Runtime**: Bedrock AgentCore Runtime (serverless ARM64 container, VPC mode, per-user sessions)
-- **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads)
-- **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content
+- **Channel Ingestion**: Router Lambda behind API Gateway HTTP API (Telegram webhook, Slack Events API, image uploads, multi-image media groups)
+- **Async Direct Response**: Container sends responses directly to Telegram/Slack via `channel-sender.js`, decoupled from Lambda timeout
+- **Streaming**: Real-time token streaming to Telegram via `sendMessageDraft` (Bot API 9.5) — users see response as it generates
+- **Multimodal**: Image upload support — photos downloaded by Router Lambda, stored in S3, fetched by proxy, sent to Bedrock as multimodal content. Multi-image media groups buffered via DynamoDB parallel wait-and-claim
+- **Web Scraping**: Scrapling + curl_cffi for TLS-impersonating HTTP requests to protected websites (Fotocasa, etc.)
 - **Messaging**: OpenClaw (Node.js) — headless mode, messages bridged via WebSocket
 - **Tools & Skills**: Built-in tool groups (full profile) + 5 ClawHub skills + 2 custom skills (S3 user files, EventBridge cron) + 2 built-in shim tools (web_fetch, web_search)
 - **Scheduling**: EventBridge Scheduler for recurring tasks — cron executor Lambda warms sessions and delivers responses to channels
@@ -114,6 +117,7 @@ openclaw-on-agentcore/
     agentcore-contract.js         # AgentCore HTTP contract with hybrid routing (shim + OpenClaw)
     lightweight-agent.js          # Warm-up agent shim (s3-user-files + eventbridge-cron tools)
     lightweight-agent.test.js     # Lightweight agent unit tests (node:test, 70 tests)
+    channel-sender.js             # Direct Telegram/Slack delivery (sendMessageDraft streaming, file attachments)
     agentcore-proxy.js            # OpenAI -> Bedrock ConverseStream adapter + Identity + multimodal images
     image-support.test.js         # Image support unit tests (node:test)
     content-extraction.test.js    # Content block extraction tests (node:test)
@@ -331,7 +335,7 @@ aws dynamodb scan --table-name openclaw-identity --region $CDK_DEFAULT_REGION
    - Wait for proxy only (~5s)
 4. **Warm-up phase** (t=~10s to ~2-4min): `lightweight-agent.js` handles messages via proxy -> Bedrock (supports s3-user-files, eventbridge-cron, web_fetch, web_search tools)
 5. **Handoff** (~2-4min): OpenClaw becomes ready, all subsequent messages route via WebSocket bridge
-6. **After handoff**: Full OpenClaw features — `web_fetch`, `web_search` (built-in), 5 ClawHub skills (Jina reader, deep-research-pro, etc.), sub-agent support, session management
+6. **After handoff**: Full OpenClaw features — `web_fetch`, `web_search` (built-in), 5 ClawHub skills (Jina reader, deep-research-pro, etc.), sub-agent support, session management. Telegram streaming via `sendMessageDraft` active for real-time token delivery
 7. **`action: warmup`**: Triggers init only; returns `{ready: true}` when OpenClaw is ready (used by cron Lambda to pre-warm sessions)
 8. **`action: cron`**: Sends a cron message via the WebSocket bridge (same as chat but intended for scheduled tasks)
 9. **`action: status`**: Returns current init state (`{openclawReady, proxyReady, uptime}`) without triggering init
@@ -456,6 +460,8 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Webhook validation**: Telegram uses `X-Telegram-Bot-Api-Secret-Token` header (set via `secret_token` on `setWebhook`). Slack uses `X-Slack-Signature` HMAC-SHA256 with 5-minute replay window
 - **Async dispatch**: Self-invokes with `InvocationType=Event` for actual processing; returns 200 immediately to webhook
 - **Slack**: Handles `url_verification` challenge synchronously; ignores retries via `x-slack-retry-num` header
+- **Async direct response**: Router Lambda passes `chatId` in the AgentCore payload. Container returns `{"status": "accepted"}` immediately. Container sends response directly to Telegram/Slack via `channel-sender.js`. Lambda returns in ~5s instead of blocking for the full response
+- **Telegram streaming**: Container streams tokens to Telegram via `sendMessageDraft` (Bot API 9.5) with `draft_id` (non-zero integer). Throttled at 300ms. Final `sendMessage` replaces draft with permanent formatted message
 - **Cold start latency**: First message to a new user triggers microVM creation; lightweight agent responds in ~10-15s while OpenClaw starts in background (~2-4 min)
 - **Typing indicator + progress message**: Telegram typing indicator sent every 4s while waiting; after 30s of waiting, a one-time progress message ("Working on your request...") is sent to both Telegram and Slack so users know the bot is still working during long subagent tasks
 - **Content block extraction**: `_extract_text_from_content_blocks()` recursively unwraps nested `[{"type":"text","text":"..."}]` JSON — subagent responses (deep-research-pro, task-decomposer) can wrap content multiple levels deep
@@ -471,6 +477,8 @@ Only the **first channel identity** needs to be allowlisted. When a user binds a
 - **Supported types**: `image/jpeg`, `image/png`, `image/gif`, `image/webp` (max 3.75 MB per Bedrock limit)
 - **Security**: S3 key validated against user's namespace prefix + path traversal (`..`) rejection. Format validated against `VALID_BEDROCK_FORMATS` set
 - **Slack prerequisite**: Bot needs `files:read` OAuth scope to download image files
+- **Multi-image (Telegram media groups)**: When user sends multiple photos at once, Telegram delivers separate webhooks with the same `media_group_id`. Each async-dispatch Lambda uploads its image in parallel, stores ref in DynamoDB (`MEDIAGRP#` PK), then sleeps `MEDIA_GROUP_QUIET_PERIOD` (3s). First Lambda to wake and claim (DynamoDB conditional write) dispatches all images in a single AgentCore invocation. No recursive self-invocation — avoids AWS Lambda loop detection
+- **Slack multi-file**: Processes all `image_files` in a single webhook event (not just first)
 
 ### Workspace Sync
 - **S3 prefix**: `{namespace}/.openclaw/` where `namespace = actorId.replace(/:/g, "_")`

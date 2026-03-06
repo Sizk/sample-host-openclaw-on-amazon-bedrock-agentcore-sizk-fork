@@ -9,6 +9,7 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 
 // --- Mirror of extractTextFromContent from agentcore-contract.js ---
+// Includes sanitization + regex fallback (must stay in sync with contract server)
 
 function extractTextFromContent(content) {
   if (!content) return "";
@@ -22,8 +23,15 @@ function extractTextFromContent(content) {
   if (typeof content === "string") {
     const trimmed = content.trim();
     if (trimmed.startsWith("[{") && trimmed.endsWith("]")) {
+      // Sanitize control characters (literal newlines, tabs)
+      const sanitized = trimmed.replace(/[\x00-\x1f]/g, (ch) => {
+        if (ch === "\n") return "\\n";
+        if (ch === "\r") return "\\r";
+        if (ch === "\t") return "\\t";
+        return "";
+      });
       try {
-        const parsed = JSON.parse(trimmed);
+        const parsed = JSON.parse(sanitized);
         if (
           Array.isArray(parsed) &&
           parsed.length > 0 &&
@@ -36,6 +44,20 @@ function extractTextFromContent(content) {
           return extractTextFromContent(text);
         }
       } catch {}
+      // Regex fallback: strip [{"type":"text","text":"..."}] wrapper
+      const prefixMatch = trimmed.match(
+        /^\[\s*\{\s*"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"/,
+      );
+      if (prefixMatch && trimmed.endsWith('"}]')) {
+        const inner = trimmed.slice(prefixMatch[0].length, -3);
+        const unescaped = inner
+          .replace(/\\n/g, "\n")
+          .replace(/\\r/g, "\r")
+          .replace(/\\t/g, "\t")
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, "\\");
+        return extractTextFromContent(unescaped);
+      }
     }
     return content;
   }
@@ -151,5 +173,55 @@ describe("extractTextFromContent", () => {
       { type: "text", text: " world" },
     ];
     assert.equal(extractTextFromContent(blocks), "Hello world");
+  });
+
+  // --- Sanitization: literal newlines in JSON strings ---
+
+  it("handles content blocks with literal newlines in JSON", () => {
+    // Build a string with actual newline bytes inside the JSON string value
+    const raw = '[{"type":"text","text":"Hello\nWorld"}]';
+    assert.equal(extractTextFromContent(raw), "Hello\nWorld");
+  });
+
+  it("handles content blocks with literal tabs in JSON", () => {
+    const raw = '[{"type":"text","text":"Col1\tCol2"}]';
+    assert.equal(extractTextFromContent(raw), "Col1\tCol2");
+  });
+
+  // --- Regex fallback: when JSON.parse fails ---
+
+  it("unwraps via regex when JSON has unmatched escaping", () => {
+    // Simulate content that JSON.parse might choke on but regex can handle
+    const raw = '[{"type":"text","text":"Hello \\n World"}]';
+    assert.equal(extractTextFromContent(raw), "Hello \n World");
+  });
+
+  it("handles escaped quotes via regex fallback", () => {
+    const raw = '[{"type":"text","text":"He said \\"hello\\""}]';
+    const result = extractTextFromContent(raw);
+    assert.equal(result, 'He said "hello"');
+  });
+
+  it("handles escaped backslashes via regex fallback", () => {
+    const raw = '[{"type":"text","text":"path\\\\to\\\\file"}]';
+    const result = extractTextFromContent(raw);
+    assert.equal(result, "path\\to\\file");
+  });
+
+  it("handles emojis in content blocks", () => {
+    const json = JSON.stringify([{ type: "text", text: "Hello 🚀 World 🌍" }]);
+    assert.equal(extractTextFromContent(json), "Hello 🚀 World 🌍");
+  });
+
+  it("handles very long content blocks (4000+ chars)", () => {
+    const longText = "A".repeat(4000) + "\n" + "B".repeat(4000);
+    const json = JSON.stringify([{ type: "text", text: longText }]);
+    assert.equal(extractTextFromContent(json), longText);
+  });
+
+  it("handles mixed newlines and markdown formatting", () => {
+    const text = "# Title\n\n━━━━━━━━\n\n**Bold** and *italic*\n\n- Item 1\n- Item 2";
+    const json = JSON.stringify([{ type: "text", text }]);
+    assert.equal(extractTextFromContent(json), text);
   });
 });

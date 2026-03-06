@@ -176,12 +176,14 @@ function extractTextFromContentBlocks(text) {
     if (prefixMatch && stripped.endsWith('"}]')) {
       const inner = stripped.slice(prefixMatch[0].length, -3);
       // Unescape JSON string escapes
+      // Unescape order matters: \\\\ → \\ must run LAST to avoid
+      // interfering with other escape sequences like \\" → "
       const unescaped = inner
         .replace(/\\n/g, "\n")
         .replace(/\\r/g, "\r")
         .replace(/\\t/g, "\t")
         .replace(/\\"/g, '"')
-        .replace(/\\\\/g, "\\");
+        .replace(/\\\\/g, "\\");  // Must be last
       if (unescaped !== result) {
         console.log(
           `[channel-sender] Content blocks unwrapped via regex fallback (${unescaped.length} chars)`,

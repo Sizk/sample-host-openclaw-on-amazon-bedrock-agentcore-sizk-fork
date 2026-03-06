@@ -13,9 +13,11 @@ RUN apt-get update && \
 # PDF: xhtml2pdf (HTML→PDF), markdown (MD→HTML), fpdf2 (simple PDFs)
 # Charts/Images: matplotlib, pillow
 # Other: qrcode (QR codes), icalendar (ICS calendar files)
+# Scraping: scrapling + curl_cffi for TLS-impersonating HTTP fetcher (no browsers needed)
 RUN pip3 install --no-cache-dir --break-system-packages \
     awscli fpdf2 xhtml2pdf markdown \
-    matplotlib pillow qrcode icalendar
+    matplotlib pillow qrcode icalendar \
+    scrapling curl_cffi
 
 # Install OpenClaw and ClawHub CLI globally
 RUN npm install -g openclaw@latest clawhub@latest
