@@ -1102,17 +1102,19 @@ def _build_multi_image_message(text, image_refs):
 
 
 # ---------------------------------------------------------------------------
-# Telegram media group buffering (event-based: parallel upload + async flush)
+# Telegram media group buffering (parallel upload + wait-and-claim)
 # ---------------------------------------------------------------------------
 #
 # When Telegram sends N photos as a media group, N separate webhooks arrive.
-# Each Lambda invocation uploads its image in parallel and stores a ref in
-# DynamoDB. The FIRST store starts an async flush chain that polls DynamoDB
-# until no new images arrive for QUIET_PERIOD seconds, then dispatches all
-# images in a single AgentCore invocation. No Lambda ever sleeps.
+# Each webhook triggers an async-dispatch Lambda that uploads its image in
+# parallel. After storing, each Lambda waits for a quiet period (no new images)
+# then races to claim the group via DynamoDB conditional write. First to claim
+# dispatches all images in a single AgentCore invocation.
+#
+# No recursive self-invocation — the wait happens inside each async-dispatch
+# Lambda, which is already a background worker (webhook returned 200 instantly).
 
 MEDIA_GROUP_QUIET_PERIOD = 3  # Seconds of inactivity before dispatching
-MEDIA_GROUP_MAX_RETRIES = 30  # Max flush re-invokes (~15s at ~500ms each)
 
 
 def _store_media_group_image(media_group_id, image_ref, text, chat_id, actor_id, user_id):
@@ -1219,42 +1221,23 @@ def _claim_media_group(media_group_id):
         return None
 
 
-def _self_invoke_flush(media_group_id, retry=0):
-    """Fire an async self-invocation to check if the media group is ready to dispatch."""
-    try:
-        lambda_client.invoke(
-            FunctionName=LAMBDA_FUNCTION_NAME,
-            InvocationType="Event",
-            Payload=json.dumps({
-                "_media_group_flush": True,
-                "_media_group_id": media_group_id,
-                "_retry": retry,
-            }).encode(),
-        )
-    except Exception as e:
-        logger.error("Media group flush self-invoke failed: %s", e)
+def _wait_and_claim_media_group(media_group_id):
+    """Wait for the quiet period, then try to claim and dispatch the media group.
 
-
-def _handle_media_group_flush(media_group_id, retry):
-    """Async flush handler: check if media group is quiet, then dispatch.
-
-    Called via async self-invoke. If images are still arriving (lastUpdated
-    is recent), re-invokes itself. Once quiet period passes, claims the
-    group and dispatches all images to AgentCore.
+    Called by each async-dispatch Lambda after storing its image. All Lambdas
+    wait in parallel, then race to claim. First to claim dispatches; others exit.
+    No recursive self-invocation — avoids AWS Lambda recursive loop detection.
     """
-    if retry >= MEDIA_GROUP_MAX_RETRIES:
-        logger.warning("Media group %s: max retries reached — force dispatching", media_group_id)
-        record = _claim_media_group(media_group_id)
-        if record:
-            _dispatch_media_group(record)
-        return
+    # Wait for the quiet period (all image uploads should be done by then)
+    time.sleep(MEDIA_GROUP_QUIET_PERIOD)
 
+    # Check if still quiet (no new images since we slept)
     try:
         resp = identity_table.get_item(
             Key={"PK": f"MEDIAGRP#{media_group_id}", "SK": "MEDIAGRP"},
         )
     except ClientError as e:
-        logger.error("Media group flush read failed: %s", e)
+        logger.error("Media group read failed: %s", e)
         return
 
     item = resp.get("Item")
@@ -1262,29 +1245,29 @@ def _handle_media_group_flush(media_group_id, retry):
         logger.warning("Media group %s: record not found", media_group_id)
         return
     if item.get("claimed"):
-        logger.info("Media group %s: already dispatched", media_group_id)
+        logger.info("Media group %s: already dispatched by another Lambda", media_group_id)
         return
 
     last_updated = float(item.get("lastUpdated", "0"))
     elapsed = time.time() - last_updated
     image_count = len(item.get("images", []))
 
-    if elapsed >= MEDIA_GROUP_QUIET_PERIOD:
-        # Quiet period passed — claim and dispatch
+    if elapsed < MEDIA_GROUP_QUIET_PERIOD:
+        # Images still arriving — sleep for the remaining time and retry once
+        remaining = MEDIA_GROUP_QUIET_PERIOD - elapsed + 0.5
         logger.info(
-            "Media group %s: quiet for %.1fs (%d images) — dispatching",
-            media_group_id, elapsed, image_count,
+            "Media group %s: still active (%.1fs ago, %d images) — waiting %.1fs more",
+            media_group_id, elapsed, image_count, remaining,
         )
-        record = _claim_media_group(media_group_id)
-        if record:
-            _dispatch_media_group(record)
+        time.sleep(remaining)
+
+    # Try to claim
+    logger.info("Media group %s: attempting claim (%d images)", media_group_id, image_count)
+    record = _claim_media_group(media_group_id)
+    if record:
+        _dispatch_media_group(record)
     else:
-        # Still receiving images — re-invoke flush
-        logger.info(
-            "Media group %s: still active (%.1fs ago, %d images) — retry %d",
-            media_group_id, elapsed, image_count, retry,
-        )
-        _self_invoke_flush(media_group_id, retry + 1)
+        logger.info("Media group %s: another Lambda dispatched", media_group_id)
 
 
 def _dispatch_media_group(record):
@@ -1450,12 +1433,11 @@ def handle_telegram(body):
         if is_first is None:
             return  # Store failed
 
-        # Every image Lambda fires a flush invoke — provides redundancy if
-        # any single flush chain gets throttled by Lambda async invoke limits.
-        # DynamoDB conditional claim ensures only one dispatch happens.
-        _self_invoke_flush(media_group_id, retry=0)
-
-        # ALL Lambdas return immediately — no sleeping, no blocking
+        # Wait for quiet period, then race to claim and dispatch.
+        # This runs inside the async-dispatch Lambda (background worker) —
+        # the webhook Lambda already returned 200 to Telegram instantly.
+        # All async-dispatch Lambdas wait in parallel; first to claim dispatches.
+        _wait_and_claim_media_group(media_group_id)
         return
 
     # --- Single image handling (no media group) ---
@@ -1680,14 +1662,6 @@ def handle_slack(body, headers=None):
 
 def handler(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
-    # Media group flush — async self-invoke to check if group is ready to dispatch
-    if event.get("_media_group_flush"):
-        _handle_media_group_flush(
-            event["_media_group_id"],
-            event.get("_retry", 0),
-        )
-        return {"statusCode": 200, "body": "ok"}
-
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
         channel = event.get("_channel")

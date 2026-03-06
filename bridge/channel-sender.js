@@ -147,6 +147,7 @@ function extractTextFromContentBlocks(text) {
       if (ch === "\t") return "\\t";
       return "";
     });
+    let parsed = false;
     try {
       const blocks = JSON.parse(sanitized);
       if (Array.isArray(blocks) && blocks.length > 0) {
@@ -157,11 +158,37 @@ function extractTextFromContentBlocks(text) {
           const unwrapped = parts.join("");
           if (unwrapped === result) break;
           result = unwrapped;
-          continue;
+          parsed = true;
         }
       }
-    } catch {
-      // Not valid JSON even after sanitization
+    } catch (e) {
+      console.warn(
+        `[channel-sender] Content block JSON.parse failed: ${e.message} | start: ${stripped.slice(0, 100)}`,
+      );
+    }
+    if (parsed) continue;
+
+    // Regex fallback: strip [{"type":"text","text":"..."}] wrapper
+    // Handles cases where JSON.parse fails due to unescaped content
+    const prefixMatch = stripped.match(
+      /^\[\s*\{\s*"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"/,
+    );
+    if (prefixMatch && stripped.endsWith('"}]')) {
+      const inner = stripped.slice(prefixMatch[0].length, -3);
+      // Unescape JSON string escapes
+      const unescaped = inner
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "\r")
+        .replace(/\\t/g, "\t")
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, "\\");
+      if (unescaped !== result) {
+        console.log(
+          `[channel-sender] Content blocks unwrapped via regex fallback (${unescaped.length} chars)`,
+        );
+        result = unescaped;
+        continue;
+      }
     }
     break;
   }
@@ -208,6 +235,41 @@ async function sendTelegramMessage(chatId, text, token) {
     console.error(
       `[channel-sender] Failed to send Telegram message to ${chatId}: ${e.message}`,
     );
+  }
+}
+
+/**
+ * Send a streaming draft to Telegram via sendMessageDraft (Bot API 9.5).
+ *
+ * The draft_id must be a non-zero integer. Same draft_id = animated update
+ * of the same draft bubble. Call sendMessage to finalize the draft into
+ * a permanent message.
+ *
+ * @param {string|number} chatId - Telegram chat ID
+ * @param {string} text - Accumulated message text so far
+ * @param {string} token - Bot API token
+ * @param {string|number} draftId - Unique draft session ID (same for all updates in one stream)
+ */
+async function sendTelegramDraft(chatId, text, token, draftId) {
+  if (!token || !draftId) return;
+  const url = `https://api.telegram.org/bot${token}/sendMessageDraft`;
+  try {
+    const { statusCode, body } = await httpsRequest(
+      url,
+      { method: "POST", headers: { "Content-Type": "application/json" } },
+      JSON.stringify({
+        chat_id: chatId,
+        draft_id: Number(draftId),
+        text,
+      }),
+    );
+    if (statusCode >= 400) {
+      console.warn(
+        `[channel-sender] sendMessageDraft failed (${statusCode}): ${body.slice(0, 200)}`,
+      );
+    }
+  } catch (e) {
+    console.warn(`[channel-sender] sendMessageDraft error: ${e.message}`);
   }
 }
 
@@ -469,6 +531,7 @@ async function deliverResponse(channel, chatId, text, files, tokens) {
 module.exports = {
   deliverResponse,
   sendTelegramMessage,
+  sendTelegramDraft,
   sendTelegramTyping,
   sendTelegramDocument,
   sendSlackMessage,

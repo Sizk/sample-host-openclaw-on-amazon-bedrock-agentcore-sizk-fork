@@ -426,6 +426,20 @@ const AGENTS_MD_CONTENT = [
   "",
   "Always ask the user for their **timezone** if you don't know it (e.g., Asia/Shanghai, America/New_York).",
   "",
+  "## Memory Persistence (IMPORTANT)",
+  "",
+  "Your conversation history does NOT survive across sessions. To remember things permanently,",
+  "you MUST save them to files using the s3-user-files skill. Check these files at the START of every conversation:",
+  "",
+  "- **USER.md**: User preferences — timezone, language, name, interests, communication style.",
+  "  When the user tells you their timezone, name, preferences, or any personal info, IMMEDIATELY",
+  "  update USER.md with `write_user_file USER.md --file=/tmp/USER.md`.",
+  "- **MEMORY.md**: Things the user explicitly asks you to remember ('remember that...', 'note that...').",
+  "  Always save these immediately — don't just acknowledge, actually write to MEMORY.md.",
+  "",
+  "At the start of each conversation, read USER.md and MEMORY.md to restore context.",
+  "If they exist, greet the user by name and reference known preferences.",
+  "",
   "## File Storage",
   "",
   "You have the **s3-user-files** skill for persistent file storage. Files survive across sessions.",
@@ -795,6 +809,20 @@ function extractTextFromContent(content) {
           return extractTextFromContent(text);
         }
       } catch {}
+      // Regex fallback: strip [{"type":"text","text":"..."}] wrapper
+      const prefixMatch = trimmed.match(
+        /^\[\s*\{\s*"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"/,
+      );
+      if (prefixMatch && trimmed.endsWith('"}]')) {
+        const inner = trimmed.slice(prefixMatch[0].length, -3);
+        const unescaped = inner
+          .replace(/\\n/g, "\n")
+          .replace(/\\r/g, "\r")
+          .replace(/\\t/g, "\t")
+          .replace(/\\"/g, '"')
+          .replace(/\\\\/g, "\\");
+        return extractTextFromContent(unescaped);
+      }
     }
     // Plain text string
     return content;
@@ -824,13 +852,13 @@ async function processMessageQueue() {
   processingMessage = true;
 
   while (messageQueue.length > 0) {
-    const { message, resolve, reject } = messageQueue.shift();
+    const { message, resolve, reject, onDelta } = messageQueue.shift();
     console.log(
       `[contract] Processing queued message (${messageQueue.length} remaining)`,
     );
 
     try {
-      const response = await bridgeMessage(message, 560000);
+      const response = await bridgeMessage(message, 560000, onDelta);
       resolve(response);
     } catch (err) {
       reject(err);
@@ -842,10 +870,11 @@ async function processMessageQueue() {
 
 /**
  * Enqueue a message and wait for its response (serialized processing).
+ * Optional onDelta callback is invoked with accumulated text on each streaming delta.
  */
-function enqueueMessage(message) {
+function enqueueMessage(message, onDelta = null) {
   return new Promise((resolve, reject) => {
-    messageQueue.push({ message, resolve, reject });
+    messageQueue.push({ message, resolve, reject, onDelta });
     console.log(
       `[contract] Message enqueued (queue length: ${messageQueue.length})`,
     );
@@ -858,7 +887,7 @@ function enqueueMessage(message) {
 /**
  * Bridge a chat message to OpenClaw via WebSocket and collect the response.
  */
-async function bridgeMessage(message, timeoutMs = 560000) {
+async function bridgeMessage(message, timeoutMs = 560000, onDelta = null) {
   const { randomUUID } = require("crypto");
   return new Promise((resolve) => {
     const wsUrl = `ws://127.0.0.1:${OPENCLAW_PORT}`;
@@ -991,7 +1020,15 @@ async function bridgeMessage(message, timeoutMs = 560000) {
 
         if (payload.state === "delta") {
           const text = extractFromPayload(payload);
-          if (text) responseText = text; // Delta replaces (accumulates progressively)
+          if (text) {
+            responseText = text; // Delta replaces (accumulates progressively)
+            // Emit streaming callback for real-time delivery (e.g., sendMessageDraft)
+            if (onDelta) {
+              Promise.resolve(onDelta(responseText)).catch((e) => {
+                console.warn(`[contract] Delta callback error: ${e.message}`);
+              });
+            }
+          }
           return;
         }
 
@@ -1194,25 +1231,50 @@ function buildBridgeText(message) {
  */
 async function processAndDeliver(bridgeText, actorId, channel, chatId) {
   const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+  const isTelegram = channel === "telegram" && TELEGRAM_BOT_TOKEN;
 
-  // Start periodic typing indicator
+  // --- Streaming draft state (Telegram only) ---
+  // Sends partial text to Telegram via sendMessageDraft (Bot API 9.5) as tokens arrive.
+  // Same draftId = animated update of the same draft bubble.
+  // Throttled to avoid hitting Telegram's 30 msg/sec rate limit.
+  const DRAFT_THROTTLE_MS = 300; // ~3 updates/sec per user
+  const DRAFT_MIN_LENGTH = 10; // Don't send drafts for very short text
+  let lastDraftTime = 0;
+  let streamingActive = false;
+  // draft_id must be a non-zero integer, unique per streaming session
+  const draftId = isTelegram ? String(Date.now() * 1000000 + Math.floor(Math.random() * 1000000)) : null;
+
+  const onDelta = isTelegram
+    ? (accumulatedText) => {
+        const now = Date.now();
+        if (now - lastDraftTime < DRAFT_THROTTLE_MS) return;
+        if (accumulatedText.length < DRAFT_MIN_LENGTH) return;
+        lastDraftTime = now;
+        if (!streamingActive) {
+          console.log(`[contract] Streaming started — first draft at ${accumulatedText.length} chars, draftId=${draftId}`);
+        }
+        streamingActive = true;
+        // Extract content blocks before sending to draft (delta text may still be wrapped)
+        const cleanDelta = channelSender.extractTextFromContentBlocks(accumulatedText);
+        channelSender.sendTelegramDraft(chatId, cleanDelta, TELEGRAM_BOT_TOKEN, draftId);
+      }
+    : null;
+
+  // Typing indicator for non-streaming paths (Slack, or fallback)
   let typingTimer = null;
-  if (channel === "telegram" && TELEGRAM_BOT_TOKEN) {
+  if (isTelegram) {
+    // Send one typing indicator immediately; drafts will replace it
     channelSender.sendTelegramTyping(chatId, TELEGRAM_BOT_TOKEN);
-    typingTimer = setInterval(() => {
-      channelSender.sendTelegramTyping(chatId, TELEGRAM_BOT_TOKEN);
-    }, 4000);
   }
 
-  // One-time progress message after 30s of processing
-  let progressSent = false;
+  // One-time progress message after 30s (only if streaming hasn't started)
   const progressTimer = setTimeout(async () => {
-    progressSent = true;
+    if (streamingActive) return; // Streaming is active — user sees tokens, no need
     const msg =
       "\u23f3 Working on your request \u2014 this may take a few minutes. " +
       "I'll send the full response when it's ready.";
     try {
-      if (channel === "telegram") {
+      if (isTelegram) {
         await channelSender.sendTelegramMessage(chatId, msg, TELEGRAM_BOT_TOKEN);
       } else if (channel === "slack") {
         await channelSender.sendSlackMessage(chatId, msg, SLACK_BOT_TOKEN);
@@ -1227,7 +1289,7 @@ async function processAndDeliver(bridgeText, actorId, channel, chatId) {
     let responseText;
     if (openclawReady) {
       try {
-        responseText = await enqueueMessage(bridgeText);
+        responseText = await enqueueMessage(bridgeText, onDelta);
       } catch (bridgeErr) {
         console.error(
           `[contract] Async bridge error, falling back to shim: ${bridgeErr.message}`,
@@ -1250,8 +1312,13 @@ async function processAndDeliver(bridgeText, actorId, channel, chatId) {
       }
     } else if (proxyReady) {
       console.log("[contract] Async routing via lightweight agent (warm-up)");
+      // Lightweight agent doesn't support streaming yet — use typing indicator
+      if (isTelegram) {
+        typingTimer = setInterval(() => {
+          channelSender.sendTelegramTyping(chatId, TELEGRAM_BOT_TOKEN);
+        }, 4000);
+      }
       try {
-        // No timeout limit in async mode — container can run as long as needed
         responseText = await agent.chat(bridgeText, actorId, Date.now() + 3600000);
       } catch (agentErr) {
         responseText =
@@ -1264,12 +1331,18 @@ async function processAndDeliver(bridgeText, actorId, channel, chatId) {
       responseText = "I'm starting up — please try again in a moment.";
     }
 
+    // Log raw response for diagnostics (first 200 chars)
+    console.log(
+      `[contract] Raw responseText (${responseText.length} chars): ${responseText.slice(0, 200)}`,
+    );
+
     // Extract [SEND_FILE:filename] markers and strip from visible text
     const { files, cleanText } = extractFileMarkers(responseText, currentNamespace);
 
-    // Deliver response directly to channel
+    // Deliver final response directly to channel
+    // This replaces the streaming draft with a permanent formatted message
     console.log(
-      `[contract] Delivering async response (${cleanText.length} chars, ${files.length} files) to ${channel}:${chatId}`,
+      `[contract] Delivering async response (${cleanText.length} chars, ${files.length} files, streamed=${streamingActive}) to ${channel}:${chatId}`,
     );
     await channelSender.deliverResponse(
       channel, chatId, cleanText, files.length > 0 ? files : null, tokens,
@@ -1277,7 +1350,6 @@ async function processAndDeliver(bridgeText, actorId, channel, chatId) {
     console.log("[contract] Async response delivered successfully");
   } catch (err) {
     console.error(`[contract] processAndDeliver failed: ${err.message}`);
-    // Send error message to user
     try {
       const errorMsg =
         "I'm sorry, something went wrong while processing your request. Please try again.";
@@ -1290,7 +1362,6 @@ async function processAndDeliver(bridgeText, actorId, channel, chatId) {
       );
     }
   } finally {
-    // Stop typing indicator and progress timer
     if (typingTimer) clearInterval(typingTimer);
     clearTimeout(progressTimer);
   }
