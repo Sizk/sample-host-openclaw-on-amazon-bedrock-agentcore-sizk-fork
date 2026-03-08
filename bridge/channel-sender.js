@@ -168,13 +168,15 @@ function extractTextFromContentBlocks(text) {
     }
     if (parsed) continue;
 
-    // Regex fallback: strip [{"type":"text","text":"..."}] wrapper
-    // Handles cases where JSON.parse fails due to unescaped content
+    // Regex fallback: strip [{"type":"text","text":"..."}] wrapper (complete or partial)
+    // During streaming, deltas may be incomplete JSON — strip the prefix anyway.
     const prefixMatch = stripped.match(
       /^\[\s*\{\s*"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"/,
     );
-    if (prefixMatch && stripped.endsWith('"}]')) {
-      const inner = stripped.slice(prefixMatch[0].length, -3);
+    if (prefixMatch) {
+      let inner = stripped.slice(prefixMatch[0].length);
+      // Strip closing "}] if present (complete content block)
+      if (inner.endsWith('"}]')) inner = inner.slice(0, -3);
       // Unescape JSON string escapes
       // Unescape order matters: \\\\ → \\ must run LAST to avoid
       // interfering with other escape sequences like \\" → "

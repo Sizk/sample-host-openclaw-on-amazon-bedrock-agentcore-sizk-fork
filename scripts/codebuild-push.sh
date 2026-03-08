@@ -32,6 +32,16 @@ echo "==> Image version: v${IMAGE_VERSION}"
 echo "==> Source bucket: s3://${SOURCE_BUCKET}/bridge-source.zip"
 echo ""
 
+# --- Pre-flight: validate OpenClaw config ------------------------------------
+echo "==> Running config validation test ..."
+(cd "$BRIDGE_DIR" && node --test config-validation.test.js) || {
+	echo "    CONFIG VALIDATION FAILED — aborting build."
+	echo "    Fix the config in openclaw-config.js and re-run."
+	exit 1
+}
+echo "    Config validation passed."
+echo ""
+
 # --- Package bridge/ source --------------------------------------------------
 echo "==> Packaging bridge/ ..."
 TMPDIR_PATH=$(mktemp -d)

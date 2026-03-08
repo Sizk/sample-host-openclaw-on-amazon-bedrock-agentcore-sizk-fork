@@ -17,7 +17,7 @@ RUN apt-get update && \
 RUN pip3 install --no-cache-dir --break-system-packages \
     awscli fpdf2 xhtml2pdf markdown \
     matplotlib pillow qrcode icalendar \
-    scrapling curl_cffi
+    scrapling curl_cffi openpyxl
 
 # Install OpenClaw and ClawHub CLI globally
 RUN npm install -g openclaw@latest clawhub@latest
@@ -105,6 +105,7 @@ RUN mkdir -p /root/.openclaw
 
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js
+COPY openclaw-config.js /app/openclaw-config.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY lightweight-agent.js /app/lightweight-agent.js
 COPY channel-sender.js /app/channel-sender.js
