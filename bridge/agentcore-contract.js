@@ -859,13 +859,16 @@ async function processAndDeliver(messageText, actorId, channel, chatId) {
   // --- Streaming draft state (Telegram only) ---
   const DRAFT_THROTTLE_MS = 300;
   const DRAFT_MIN_LENGTH = 10;
+  const DRAFT_STARTUP_DELAY_MS = 3000; // Don't start streaming for the first 3s (avoids ghost drafts on short responses)
   let lastDraftTime = 0;
   let streamingActive = false;
   const draftId = isTelegram ? String(Date.now() * 1000000 + Math.floor(Math.random() * 1000000)) : null;
+  const streamStartTime = Date.now();
 
   const onDelta = isTelegram
     ? (accumulatedText) => {
         const now = Date.now();
+        if (now - streamStartTime < DRAFT_STARTUP_DELAY_MS) return; // Skip early drafts
         if (now - lastDraftTime < DRAFT_THROTTLE_MS) return;
         if (accumulatedText.length < DRAFT_MIN_LENGTH) return;
         lastDraftTime = now;
@@ -951,6 +954,7 @@ async function processAndDeliver(messageText, actorId, channel, chatId) {
         "I'm sorry, something went wrong while processing your request. Please try again.";
       await channelSender.deliverResponse(
         channel, chatId, errorMsg, null, tokens,
+        streamingActive ? draftId : null, // Replace orphaned draft if streaming was active
       );
     } catch (e) {
       console.error(
@@ -1232,14 +1236,23 @@ const server = http.createServer(async (req, res) => {
 
             // If agent is busy, check if this is a status query
             if (chatBusy) {
-              const status = customAgent.getSubagentStatus();
-              if (isStatusQuery(messageText) && status) {
-                // Respond immediately with sub-agent progress
-                const statusMsg = formatSubagentStatus(status);
-                console.log(`[contract] Status query while busy — responding immediately`);
-                const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
-                channelSender.deliverResponse(channel, chatId, statusMsg, null, tokens)
-                  .catch((e) => console.error(`[contract] Status delivery failed: ${e.message}`));
+              if (isStatusQuery(messageText)) {
+                const status = customAgent.getSubagentStatus();
+                if (status) {
+                  // Sub-agents running — respond with detailed progress
+                  const statusMsg = formatSubagentStatus(status);
+                  console.log(`[contract] Status query while busy (subagents active) — responding immediately`);
+                  const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+                  channelSender.deliverResponse(channel, chatId, statusMsg, null, tokens)
+                    .catch((e) => console.error(`[contract] Status delivery failed: ${e.message}`));
+                } else {
+                  // Busy but no sub-agents — send a brief acknowledgment
+                  console.log(`[contract] Status query while busy (no subagents) — sending ack`);
+                  const ackMsg = "Working on your previous message — I'll respond as soon as I'm done.";
+                  const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+                  channelSender.deliverResponse(channel, chatId, ackMsg, null, tokens)
+                    .catch((e) => console.error(`[contract] Ack delivery failed: ${e.message}`));
+                }
                 return;
               }
 
