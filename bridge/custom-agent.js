@@ -47,6 +47,31 @@ const MAX_TOOL_RESULT_CHARS = 100000; // Truncate tool results over 100KB
 const MAX_CONCURRENT_SUBAGENTS = 3;
 const SUBAGENT_MODEL = "bedrock-agentcore-subagent";
 
+// ---------------------------------------------------------------------------
+// Sub-agent status tracking — shared state for real-time progress reporting
+// ---------------------------------------------------------------------------
+
+const subagentStatus = {
+  active: false,
+  startedAt: 0,
+  mainTask: "",          // What the main agent asked the sub-agents to do
+  agents: [],            // Per-agent status: { id, toolSet, description, iteration, maxIterations, lastTool, lastToolArg, status }
+};
+
+/**
+ * Get a snapshot of current sub-agent status (safe to read while agents run).
+ */
+function getSubagentStatus() {
+  if (!subagentStatus.active) return null;
+  const elapsed = Math.round((Date.now() - subagentStatus.startedAt) / 1000);
+  return {
+    active: true,
+    elapsedSeconds: elapsed,
+    mainTask: subagentStatus.mainTask,
+    agents: subagentStatus.agents.map((a) => ({ ...a })),
+  };
+}
+
 // Sub-agent context blocks — injected as system prompt prefix so sub-agents
 // get critical operational knowledge that only the main agent receives via CLAUDE.md.
 const SUBAGENT_CONTEXT_BASE =
@@ -915,7 +940,7 @@ async function executeTool(toolName, args, userId) {
 /**
  * Run a single sub-agent: independent Bedrock conversation loop.
  */
-async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet = "general") {
+async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet = "general", agentIndex = 0) {
   const subTools = TOOLS.filter(
     (t) => toolNames.includes(t.function.name) && t.function.name !== "spawn_subagents", // no recursive spawning
   );
@@ -930,9 +955,22 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
     },
   ];
 
+  // Update status tracker
+  if (subagentStatus.agents[agentIndex]) {
+    subagentStatus.agents[agentIndex].status = "running";
+  }
+
   for (let i = 0; i < MAX_SUBAGENT_ITERATIONS; i++) {
+    // Update iteration in status tracker
+    if (subagentStatus.agents[agentIndex]) {
+      subagentStatus.agents[agentIndex].iteration = i + 1;
+    }
+
     if (Date.now() > deadline) {
       console.warn(`[subagent] Deadline exceeded at iteration ${i + 1}`);
+      if (subagentStatus.agents[agentIndex]) {
+        subagentStatus.agents[agentIndex].status = "deadline_exceeded";
+      }
       break;
     }
 
@@ -941,17 +979,28 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
       response = await callProxy(messages, { model: SUBAGENT_MODEL, tools: subTools });
     } catch (err) {
       console.error(`[subagent] Proxy call failed: ${err.message}`);
+      if (subagentStatus.agents[agentIndex]) {
+        subagentStatus.agents[agentIndex].status = "error";
+      }
       return `Sub-agent error: ${err.message}`;
     }
 
     const choice = response.choices?.[0];
-    if (!choice) return "Sub-agent received no response";
+    if (!choice) {
+      if (subagentStatus.agents[agentIndex]) {
+        subagentStatus.agents[agentIndex].status = "completed";
+      }
+      return "Sub-agent received no response";
+    }
 
     const assistantMessage = choice.message;
     messages.push(assistantMessage);
 
     const toolCalls = assistantMessage.tool_calls;
     if (!toolCalls || toolCalls.length === 0) {
+      if (subagentStatus.agents[agentIndex]) {
+        subagentStatus.agents[agentIndex].status = "completed";
+      }
       return assistantMessage.content || "(no output from sub-agent)";
     }
 
@@ -966,6 +1015,15 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
         messages.push({ role: "tool", tool_call_id: toolCall.id, content: "Error: Invalid JSON arguments" });
         continue;
       }
+      // Update status tracker with current tool
+      if (subagentStatus.agents[agentIndex]) {
+        subagentStatus.agents[agentIndex].lastTool = fnName;
+        subagentStatus.agents[agentIndex].lastToolArg =
+          fnName === "web_fetch" ? (fnArgs.url || "").slice(0, 100) :
+          fnName === "exec" ? (fnArgs.command || "").slice(0, 80) :
+          fnName === "web_search" ? (fnArgs.query || "").slice(0, 80) :
+          "";
+      }
       console.log(`[subagent] Tool: ${fnName}`);
       const result = await executeTool(fnName, fnArgs, userId);
       messages.push({
@@ -974,6 +1032,9 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
         content: (result || "").substring(0, MAX_TOOL_RESULT_CHARS),
       });
     }
+  }
+  if (subagentStatus.agents[agentIndex]) {
+    subagentStatus.agents[agentIndex].status = "iteration_limit";
   }
   return "Sub-agent reached iteration limit";
 }
@@ -991,22 +1052,44 @@ async function executeSpawnSubagents(args, userId) {
   const deadline = Date.now() + 3600000; // 1 hour
   console.log(`[agent] Spawning ${tasks.length} sub-agent(s)`);
 
+  // Initialize sub-agent status tracker
+  subagentStatus.active = true;
+  subagentStatus.startedAt = Date.now();
+  subagentStatus.mainTask = tasks.map((t) => t.description?.slice(0, 100) || "").join("; ");
+  subagentStatus.agents = tasks.map((task, i) => ({
+    id: i + 1,
+    toolSet: task.tool_set || "general",
+    description: (task.description || "").slice(0, 120),
+    iteration: 0,
+    maxIterations: MAX_SUBAGENT_ITERATIONS,
+    lastTool: "",
+    lastToolArg: "",
+    status: "starting",
+  }));
+
   const promises = tasks.map((task, i) => {
     const toolSet = task.tool_set || "general";
     const toolNames = SUBAGENT_TOOL_SETS[toolSet] || SUBAGENT_TOOL_SETS.general;
     console.log(`[agent] Sub-agent ${i + 1}: ${toolSet} (${toolNames.length} tools)`);
-    return runSubagent(task.description, toolNames, userId, deadline, toolSet);
+    return runSubagent(task.description, toolNames, userId, deadline, toolSet, i);
   });
 
-  const results = await Promise.allSettled(promises);
+  try {
+    const results = await Promise.allSettled(promises);
 
-  const output = results.map((r, i) => {
-    const status = r.status === "fulfilled" ? "completed" : "failed";
-    const value = r.status === "fulfilled" ? r.value : r.reason?.message || "Unknown error";
-    return `--- Sub-agent ${i + 1} (${status}) ---\n${value}`;
-  });
+    const output = results.map((r, i) => {
+      const status = r.status === "fulfilled" ? "completed" : "failed";
+      const value = r.status === "fulfilled" ? r.value : r.reason?.message || "Unknown error";
+      return `--- Sub-agent ${i + 1} (${status}) ---\n${value}`;
+    });
 
-  return output.join("\n\n");
+    return output.join("\n\n");
+  } finally {
+    // Clear status tracker
+    subagentStatus.active = false;
+    subagentStatus.agents = [];
+    subagentStatus.mainTask = "";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,6 +1265,7 @@ module.exports = {
   chat,
   resetHistory,
   setExecEnv,
+  getSubagentStatus,
   // Exported for testing
   TOOLS,
   SYSTEM_PROMPT,
@@ -1203,6 +1287,7 @@ module.exports = {
   parseSearchResults,
   validateUrlSafety,
   validateResolvedIps,
+  subagentStatus,
   // Constants for testing
   MAX_ITERATIONS,
   MAX_SUBAGENT_ITERATIONS,

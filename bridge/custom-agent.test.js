@@ -582,6 +582,48 @@ describe("buildSubagentSystemPrompt", () => {
 });
 
 // ---------------------------------------------------------------------------
+// subagentStatus and getSubagentStatus
+// ---------------------------------------------------------------------------
+
+describe("subagentStatus", () => {
+  it("is initially inactive", () => {
+    assert.equal(agent.subagentStatus.active, false);
+    assert.deepStrictEqual(agent.subagentStatus.agents, []);
+  });
+
+  it("getSubagentStatus returns null when inactive", () => {
+    agent.subagentStatus.active = false;
+    assert.equal(agent.getSubagentStatus(), null);
+  });
+
+  it("getSubagentStatus returns snapshot when active", () => {
+    agent.subagentStatus.active = true;
+    agent.subagentStatus.startedAt = Date.now() - 5000;
+    agent.subagentStatus.mainTask = "Scrape 100 websites";
+    agent.subagentStatus.agents = [
+      { id: 1, toolSet: "web_scraping", description: "Scrape batch 1", iteration: 3, maxIterations: 15, lastTool: "web_fetch", lastToolArg: "https://example.com", status: "running" },
+      { id: 2, toolSet: "web_scraping", description: "Scrape batch 2", iteration: 7, maxIterations: 15, lastTool: "exec", lastToolArg: "node puppeteer.js", status: "running" },
+    ];
+    const snapshot = agent.getSubagentStatus();
+    assert.ok(snapshot.active);
+    assert.ok(snapshot.elapsedSeconds >= 4 && snapshot.elapsedSeconds <= 10);
+    assert.equal(snapshot.agents.length, 2);
+    assert.equal(snapshot.agents[0].iteration, 3);
+    assert.equal(snapshot.agents[1].lastTool, "exec");
+    assert.equal(snapshot.mainTask, "Scrape 100 websites");
+
+    // Verify it's a snapshot (modifying it doesn't affect original)
+    snapshot.agents[0].iteration = 999;
+    assert.equal(agent.subagentStatus.agents[0].iteration, 3);
+
+    // Clean up
+    agent.subagentStatus.active = false;
+    agent.subagentStatus.agents = [];
+    agent.subagentStatus.mainTask = "";
+  });
+});
+
+// ---------------------------------------------------------------------------
 // setExecEnv
 // ---------------------------------------------------------------------------
 

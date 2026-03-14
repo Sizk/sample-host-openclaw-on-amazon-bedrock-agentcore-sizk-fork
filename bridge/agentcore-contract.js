@@ -774,6 +774,77 @@ async function init(userId, actorId, channel) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Message queue — serialize chat() calls to prevent race conditions.
+// When agent is busy (processing a message), new messages are queued.
+// Status queries while sub-agents run get an immediate response.
+// ---------------------------------------------------------------------------
+
+let chatBusy = false;
+const messageQueue = []; // { messageText, actorId, channel, chatId }
+
+/**
+ * Detect if a message is a status/progress query.
+ * These get immediate responses when sub-agents are running.
+ */
+function isStatusQuery(text) {
+  if (!text || typeof text !== "string") return false;
+  const lower = text.toLowerCase().trim();
+  const patterns = [
+    /^(como|cómo)\s+(va|vas|vamos)/,
+    /^(que|qué)\s+tal\s+(va|vas)/,
+    /^(how('s| is|s)?\s+(it|that|the task)?\s*(going|progressing|doing))/,
+    /^status\b/,
+    /^progress\b/,
+    /\?{2,}$/,                       // ends with "??" — probably asking about status
+    /^(sigues|estas|estás)\s+(ahí|ahi|trabajando)/,
+    /^(still|are you)\s+(there|working|running)/,
+    /^(en que|en qué)\s+(andas|vas|estas|estás)/,
+    /^(what'?s?\s+happening|what are you doing)/,
+  ];
+  return patterns.some((p) => p.test(lower));
+}
+
+/**
+ * Format sub-agent status as a user-friendly message.
+ */
+function formatSubagentStatus(status) {
+  if (!status) return null;
+  const elapsed = status.elapsedSeconds;
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+  let msg = `Working on it (${timeStr} elapsed).\n\n`;
+  for (const a of status.agents) {
+    const progress = `${a.iteration}/${a.maxIterations}`;
+    const statusEmoji = a.status === "running" ? "\u2699\ufe0f" : a.status === "completed" ? "\u2705" : "\u23f3";
+    msg += `${statusEmoji} Agent ${a.id} [${a.toolSet}]: step ${progress}`;
+    if (a.lastTool) {
+      msg += ` — ${a.lastTool}`;
+      if (a.lastToolArg) msg += `: ${a.lastToolArg}`;
+    }
+    msg += `\n`;
+  }
+  return msg.trim();
+}
+
+/**
+ * Process queued messages one at a time.
+ */
+async function drainQueue() {
+  while (messageQueue.length > 0) {
+    const next = messageQueue.shift();
+    console.log(`[contract] Processing queued message (${messageQueue.length} remaining)`);
+    try {
+      await processAndDeliver(next.messageText, next.actorId, next.channel, next.chatId);
+    } catch (err) {
+      console.error(`[contract] Queued processAndDeliver error: ${err.message}`);
+    }
+  }
+  chatBusy = false;
+}
+
 /**
  * Process a message and deliver the response directly to the user's channel.
  * Used in async mode — runs in the background after returning "accepted".
@@ -1155,14 +1226,46 @@ const server = http.createServer(async (req, res) => {
 
           // --- Async mode: return "accepted" immediately, process in background ---
           if (chatId) {
-            console.log(`[contract] Async mode: chatId=${chatId} channel=${channel}`);
+            console.log(`[contract] Async mode: chatId=${chatId} channel=${channel} busy=${chatBusy}`);
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "accepted", userId: currentUserId }));
 
-            // Process and deliver in background (fire-and-forget)
-            processAndDeliver(messageText, actorId, channel, chatId).catch((err) => {
-              console.error(`[contract] processAndDeliver error: ${err.message}`);
-            });
+            // If agent is busy, check if this is a status query
+            if (chatBusy) {
+              const status = customAgent.getSubagentStatus();
+              if (isStatusQuery(messageText) && status) {
+                // Respond immediately with sub-agent progress
+                const statusMsg = formatSubagentStatus(status);
+                console.log(`[contract] Status query while busy — responding immediately`);
+                const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+                channelSender.deliverResponse(channel, chatId, statusMsg, null, tokens)
+                  .catch((e) => console.error(`[contract] Status delivery failed: ${e.message}`));
+                return;
+              }
+
+              // Not a status query — queue the message
+              console.log(`[contract] Agent busy — queuing message (queue size: ${messageQueue.length})`);
+              messageQueue.push({ messageText, actorId, channel, chatId });
+              return;
+            }
+
+            // Agent not busy — process immediately
+            chatBusy = true;
+            processAndDeliver(messageText, actorId, channel, chatId)
+              .catch((err) => {
+                console.error(`[contract] processAndDeliver error: ${err.message}`);
+              })
+              .then(() => {
+                // Drain any queued messages
+                if (messageQueue.length > 0) {
+                  drainQueue().catch((err) => {
+                    console.error(`[contract] drainQueue error: ${err.message}`);
+                    chatBusy = false;
+                  });
+                } else {
+                  chatBusy = false;
+                }
+              });
             return;
           }
 
