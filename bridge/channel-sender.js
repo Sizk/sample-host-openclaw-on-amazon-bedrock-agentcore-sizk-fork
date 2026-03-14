@@ -217,12 +217,17 @@ function extractTextFromContentBlocks(text) {
 // Telegram API
 // ---------------------------------------------------------------------------
 
-async function sendTelegramMessage(chatId, text, token) {
+async function sendTelegramMessage(chatId, text, token, draftId) {
   if (!token) {
     console.error("[channel-sender] No Telegram token available");
     return;
   }
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
+
+  // Build base payload — include draft_id to finalize a streaming draft
+  // so Telegram replaces the draft bubble in-place instead of creating a new message.
+  const basePayload = { chat_id: chatId };
+  if (draftId) basePayload.draft_id = Number(draftId);
 
   // Try HTML first (converted from Markdown)
   const htmlText = markdownToTelegramHtml(text);
@@ -230,7 +235,7 @@ async function sendTelegramMessage(chatId, text, token) {
     const { statusCode, body } = await httpsRequest(
       url,
       { method: "POST", headers: { "Content-Type": "application/json" } },
-      JSON.stringify({ chat_id: chatId, text: htmlText, parse_mode: "HTML" }),
+      JSON.stringify({ ...basePayload, text: htmlText, parse_mode: "HTML" }),
     );
     if (statusCode >= 200 && statusCode < 300) return;
     console.warn(
@@ -247,7 +252,7 @@ async function sendTelegramMessage(chatId, text, token) {
     await httpsRequest(
       url,
       { method: "POST", headers: { "Content-Type": "application/json" } },
-      JSON.stringify({ chat_id: chatId, text }),
+      JSON.stringify({ ...basePayload, text }),
     );
   } catch (e) {
     console.error(
@@ -519,21 +524,23 @@ async function sendResponseFiles(files, channel, chatId, tokens) {
 // Top-level: deliver response to channel
 // ---------------------------------------------------------------------------
 
-async function deliverResponse(channel, chatId, text, files, tokens) {
+async function deliverResponse(channel, chatId, text, files, tokens, draftId) {
   // Extract content blocks if wrapped
   const cleanText = extractTextFromContentBlocks(text);
 
   if (channel === "telegram") {
     const token = tokens.telegram;
     if (cleanText.length <= 4096) {
-      await sendTelegramMessage(chatId, cleanText, token);
+      // Pass draftId to first (only) message — finalizes the streaming draft in-place
+      await sendTelegramMessage(chatId, cleanText, token, draftId);
     } else {
-      // Split into 4096-char chunks
+      // Split into 4096-char chunks — only first chunk finalizes the draft
       for (let i = 0; i < cleanText.length; i += 4096) {
         await sendTelegramMessage(
           chatId,
           cleanText.slice(i, i + 4096),
           token,
+          i === 0 ? draftId : null,
         );
       }
     }

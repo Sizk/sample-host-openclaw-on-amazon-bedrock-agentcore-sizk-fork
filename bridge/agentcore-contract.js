@@ -870,6 +870,7 @@ async function processAndDeliver(messageText, actorId, channel, chatId) {
     );
     await channelSender.deliverResponse(
       channel, chatId, cleanText, files.length > 0 ? files : null, tokens,
+      streamingActive ? draftId : null,
     );
     console.log("[contract] Response delivered successfully");
   } catch (err) {
