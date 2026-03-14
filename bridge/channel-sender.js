@@ -217,17 +217,12 @@ function extractTextFromContentBlocks(text) {
 // Telegram API
 // ---------------------------------------------------------------------------
 
-async function sendTelegramMessage(chatId, text, token, draftId) {
+async function sendTelegramMessage(chatId, text, token) {
   if (!token) {
     console.error("[channel-sender] No Telegram token available");
     return;
   }
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
-
-  // Build base payload — include draft_id to finalize a streaming draft
-  // so Telegram replaces the draft bubble in-place instead of creating a new message.
-  const basePayload = { chat_id: chatId };
-  if (draftId) basePayload.draft_id = Number(draftId);
 
   // Try HTML first (converted from Markdown)
   const htmlText = markdownToTelegramHtml(text);
@@ -235,7 +230,7 @@ async function sendTelegramMessage(chatId, text, token, draftId) {
     const { statusCode, body } = await httpsRequest(
       url,
       { method: "POST", headers: { "Content-Type": "application/json" } },
-      JSON.stringify({ ...basePayload, text: htmlText, parse_mode: "HTML" }),
+      JSON.stringify({ chat_id: chatId, text: htmlText, parse_mode: "HTML" }),
     );
     if (statusCode >= 200 && statusCode < 300) return;
     console.warn(
@@ -252,7 +247,7 @@ async function sendTelegramMessage(chatId, text, token, draftId) {
     await httpsRequest(
       url,
       { method: "POST", headers: { "Content-Type": "application/json" } },
-      JSON.stringify({ ...basePayload, text }),
+      JSON.stringify({ chat_id: chatId, text }),
     );
   } catch (e) {
     console.error(
@@ -265,26 +260,28 @@ async function sendTelegramMessage(chatId, text, token, draftId) {
  * Send a streaming draft to Telegram via sendMessageDraft (Bot API 9.5).
  *
  * The draft_id must be a non-zero integer. Same draft_id = animated update
- * of the same draft bubble. Call sendMessage to finalize the draft into
- * a permanent message.
+ * of the same draft bubble. The last draft sent becomes the final visible message.
  *
  * @param {string|number} chatId - Telegram chat ID
  * @param {string} text - Accumulated message text so far
  * @param {string} token - Bot API token
  * @param {string|number} draftId - Unique draft session ID (same for all updates in one stream)
+ * @param {string} [parseMode] - Optional parse_mode ("HTML" for final formatted message)
  */
-async function sendTelegramDraft(chatId, text, token, draftId) {
+async function sendTelegramDraft(chatId, text, token, draftId, parseMode) {
   if (!token || !draftId) return;
   const url = `https://api.telegram.org/bot${token}/sendMessageDraft`;
+  const payload = {
+    chat_id: chatId,
+    draft_id: Number(draftId),
+    text,
+  };
+  if (parseMode) payload.parse_mode = parseMode;
   try {
     const { statusCode, body } = await httpsRequest(
       url,
       { method: "POST", headers: { "Content-Type": "application/json" } },
-      JSON.stringify({
-        chat_id: chatId,
-        draft_id: Number(draftId),
-        text,
-      }),
+      JSON.stringify(payload),
     );
     if (statusCode >= 400) {
       console.warn(
@@ -530,17 +527,29 @@ async function deliverResponse(channel, chatId, text, files, tokens, draftId) {
 
   if (channel === "telegram") {
     const token = tokens.telegram;
-    if (cleanText.length <= 4096) {
-      // Pass draftId to first (only) message — finalizes the streaming draft in-place
-      await sendTelegramMessage(chatId, cleanText, token, draftId);
+
+    if (draftId) {
+      // Streaming was active — finalize by sending one last draft with HTML formatting.
+      // This replaces the streaming draft in-place. Do NOT call sendMessage (creates duplicate).
+      const htmlText = markdownToTelegramHtml(cleanText);
+      if (cleanText.length <= 4096) {
+        await sendTelegramDraft(chatId, htmlText, token, draftId, "HTML");
+      } else {
+        // For long messages, send first chunk as final draft, rest as regular messages
+        await sendTelegramDraft(chatId, markdownToTelegramHtml(cleanText.slice(0, 4096)), token, draftId, "HTML");
+        for (let i = 4096; i < cleanText.length; i += 4096) {
+          await sendTelegramMessage(chatId, cleanText.slice(i, i + 4096), token);
+        }
+      }
+    } else if (cleanText.length <= 4096) {
+      await sendTelegramMessage(chatId, cleanText, token);
     } else {
-      // Split into 4096-char chunks — only first chunk finalizes the draft
+      // Split into 4096-char chunks
       for (let i = 0; i < cleanText.length; i += 4096) {
         await sendTelegramMessage(
           chatId,
           cleanText.slice(i, i + 4096),
           token,
-          i === 0 ? draftId : null,
         );
       }
     }
