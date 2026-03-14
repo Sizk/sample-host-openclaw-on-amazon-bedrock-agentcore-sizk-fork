@@ -436,7 +436,7 @@ const TOOLS = [
 
 // Sub-agent tool sets — subsets of the main tools
 const SUBAGENT_TOOL_SETS = {
-  web_scraping: ["exec", "web_fetch", "web_search", "read_file", "read_user_file", "write_user_file"],
+  web_scraping: ["exec", "web_search", "read_file", "read_user_file", "write_user_file"],
   finance: ["exec", "web_fetch", "web_search", "read_file", "read_user_file", "write_user_file"],
   research: ["exec", "web_fetch", "web_search", "read_file", "read_user_file", "write_user_file"],
   data_processing: ["exec", "read_file", "read_user_file", "write_user_file", "list_user_files"],
@@ -975,22 +975,34 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
     }
 
     let response;
-    try {
-      response = await callProxy(messages, { model: SUBAGENT_MODEL, tools: subTools });
-    } catch (err) {
-      console.error(`[subagent] Proxy call failed: ${err.message}`);
+    let choice;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        response = await callProxy(messages, { model: SUBAGENT_MODEL, tools: subTools });
+      } catch (err) {
+        console.error(`[subagent] Proxy call failed (attempt ${attempt + 1}): ${err.message}`);
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+          continue;
+        }
+        if (subagentStatus.agents[agentIndex]) {
+          subagentStatus.agents[agentIndex].status = "error";
+        }
+        return `Sub-agent error: ${err.message}`;
+      }
+      choice = response.choices?.[0];
+      if (choice) break;
+      const errDetail = response.error?.message || JSON.stringify(response).slice(0, 300);
+      console.error(`[subagent] No choices (attempt ${attempt + 1}): ${errDetail}`);
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+      }
+    }
+    if (!choice) {
       if (subagentStatus.agents[agentIndex]) {
         subagentStatus.agents[agentIndex].status = "error";
       }
-      return `Sub-agent error: ${err.message}`;
-    }
-
-    const choice = response.choices?.[0];
-    if (!choice) {
-      if (subagentStatus.agents[agentIndex]) {
-        subagentStatus.agents[agentIndex].status = "completed";
-      }
-      return "Sub-agent received no response";
+      return "Sub-agent received no response after retries";
     }
 
     const assistantMessage = choice.message;
@@ -1176,17 +1188,27 @@ async function chat(userMessage, actorId, deadlineMs = 0, onDelta = null) {
     console.log(`[agent] Iteration ${i + 1}/${MAX_ITERATIONS} (${conversationHistory.length} messages)`);
 
     let response;
-    try {
-      response = await callProxy(conversationHistory);
-    } catch (err) {
-      console.error(`[agent] Proxy call failed: ${err.message}`);
-      return "I'm having trouble right now. Please try again in a moment.";
-    }
-
-    const choice = response.choices?.[0];
-    if (!choice) {
+    let choice;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        response = await callProxy(conversationHistory);
+      } catch (err) {
+        console.error(`[agent] Proxy call failed (attempt ${attempt + 1}): ${err.message}`);
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+          continue;
+        }
+        return "I'm having trouble right now. Please try again in a moment.";
+      }
+      choice = response.choices?.[0];
+      if (choice) break;
       const errDetail = response.error?.message || JSON.stringify(response).slice(0, 300);
-      console.error(`[agent] No choices in response: ${errDetail}`);
+      console.error(`[agent] No choices in response (attempt ${attempt + 1}): ${errDetail}`);
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+      }
+    }
+    if (!choice) {
       return "I received an unexpected response. Please try again.";
     }
 

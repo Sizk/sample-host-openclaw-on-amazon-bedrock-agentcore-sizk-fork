@@ -470,10 +470,11 @@ describe("SUBAGENT_TOOL_SETS", () => {
     }
   });
 
-  it("web_scraping includes web_fetch and web_search", () => {
+  it("web_scraping includes web_search but NOT web_fetch (force Puppeteer)", () => {
     const tools = agent.SUBAGENT_TOOL_SETS.web_scraping;
-    assert.ok(tools.includes("web_fetch"));
+    assert.ok(!tools.includes("web_fetch"), "web_scraping should NOT include web_fetch");
     assert.ok(tools.includes("web_search"));
+    assert.ok(tools.includes("exec"), "web_scraping must include exec for Puppeteer scripts");
   });
 
   it("general has the most tools", () => {
