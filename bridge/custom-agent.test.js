@@ -514,7 +514,8 @@ describe("buildSubagentSystemPrompt", () => {
     assert.ok(result.includes("ws://127.0.0.1:9222"), "has Lightpanda endpoint");
     assert.ok(result.includes("puppeteer"), "has Puppeteer reference");
     assert.ok(result.includes("Scrapling"), "has Scrapling reference");
-    assert.ok(result.includes("FOLLOW THIS ORDER"), "has strategy ordering");
+    assert.ok(result.includes("NEVER kill"), "forbids killing Lightpanda");
+    assert.ok(result.includes("NEVER run `pkill"), "forbids pkill command");
   });
 
   it("includes scraping context for research tool set", () => {

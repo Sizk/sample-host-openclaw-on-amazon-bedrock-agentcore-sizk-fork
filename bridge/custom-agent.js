@@ -84,33 +84,44 @@ const SUBAGENT_CONTEXT_BASE =
   "- For large content, use bash heredoc to write to /tmp/ then upload with file_path\n";
 
 const SUBAGENT_CONTEXT_SCRAPING =
-  "\n## Web Scraping — Use the Right Tool!\n\n" +
-  "A Lightpanda headless browser is ALWAYS running at ws://127.0.0.1:9222 (CDP protocol).\n\n" +
-  "### Scraping Strategy (FOLLOW THIS ORDER)\n" +
-  "1. **Puppeteer + Lightpanda** (PREFERRED) — for ANY JS-rendered site, real estate portal, news site, SPA:\n" +
+  "\n## Web Scraping — Puppeteer + Lightpanda\n\n" +
+  "A shared Lightpanda headless browser is ALWAYS running at ws://127.0.0.1:9222 (CDP).\n" +
+  "**CRITICAL RULES:**\n" +
+  "- NEVER kill, restart, or pkill Lightpanda — it is a shared service used by all agents\n" +
+  "- NEVER run `pkill lightpanda` or `killall lightpanda` or restart it in any way\n" +
+  "- If you get ECONNREFUSED, wait 2-3 seconds and retry — another agent may be temporarily using it\n" +
+  "- Always use `browser.createBrowserContext()` for isolation — each page gets its own context\n" +
+  "- Always close pages and disconnect when done to free resources for other agents\n\n" +
+  "### Scraping with Puppeteer (use `exec` tool)\n" +
+  "Write a Node.js script to /tmp/ and run it. Process sites SEQUENTIALLY (one at a time):\n" +
   "```javascript\n" +
   "const puppeteer = require('puppeteer-core');\n" +
-  "const browser = await puppeteer.connect({browserWSEndpoint:'ws://127.0.0.1:9222'});\n" +
-  "const page = await (await browser.createBrowserContext()).newPage();\n" +
-  "await page.goto('https://example.com', {waitUntil:'networkidle0', timeout: 30000});\n" +
-  "// Accept cookie banners if present\n" +
-  "await page.evaluate(() => {\n" +
-  "  const btns = [...document.querySelectorAll('button')];\n" +
-  "  const accept = btns.find(b => /accept|aceptar|acepto/i.test(b.textContent));\n" +
-  "  if (accept) accept.click();\n" +
-  "});\n" +
-  "await new Promise(r => setTimeout(r, 1000));\n" +
-  "const data = await page.evaluate(() => document.body.innerText);\n" +
-  "await page.close(); await browser.disconnect();\n" +
+  "const urls = ['https://site1.com', 'https://site2.com'];\n" +
+  "const results = [];\n" +
+  "for (const url of urls) {\n" +
+  "  let browser;\n" +
+  "  try {\n" +
+  "    browser = await puppeteer.connect({browserWSEndpoint:'ws://127.0.0.1:9222'});\n" +
+  "    const ctx = await browser.createBrowserContext();\n" +
+  "    const page = await ctx.newPage();\n" +
+  "    await page.goto(url, {waitUntil:'networkidle0', timeout:30000});\n" +
+  "    const text = await page.evaluate(() => document.body.innerText);\n" +
+  "    results.push({url, ok: true, snippet: text.slice(0,500)});\n" +
+  "    await page.close();\n" +
+  "  } catch(e) { results.push({url, ok: false, error: e.message}); }\n" +
+  "  finally { if(browser) await browser.disconnect(); }\n" +
+  "}\n" +
+  "console.log(JSON.stringify(results, null, 2));\n" +
   "```\n" +
-  "2. **Scrapling** (Python, TLS-impersonating) — if Puppeteer fails (CAPTCHA, anti-bot):\n" +
+  "**TIP**: For batch testing many sites, write ONE script that loops through all URLs and outputs structured JSON.\n" +
+  "This is much more efficient than calling `exec` once per URL.\n\n" +
+  "### Fallback: Scrapling (Python, TLS-impersonating)\n" +
+  "Only if Puppeteer fails due to CAPTCHA or anti-bot:\n" +
   "```python\n" +
   "from scrapling.fetchers import Fetcher\n" +
   "page = Fetcher.get('https://example.com', impersonate='chrome')\n" +
   "data = page.css('.selector::text').getall()\n" +
-  "```\n" +
-  "3. **web_fetch** — ONLY for simple static pages, APIs, or RSS feeds\n\n" +
-  "IMPORTANT: Use `exec` to run Puppeteer/Scrapling scripts. The `web_fetch` tool is a LAST RESORT for scraping.\n" +
+  "```\n\n" +
   "Does NOT work on: Idealista (DataDome CAPTCHA), Milanuncios (CAPTCHA).\n";
 
 const SUBAGENT_CONTEXT_DATA =
