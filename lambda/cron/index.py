@@ -38,7 +38,7 @@ agentcore_client = boto3.client(
     "bedrock-agentcore",
     region_name=AWS_REGION,
     config=Config(
-        read_timeout=max(LAMBDA_TIMEOUT_SECONDS - 30, 60),
+        read_timeout=60,  # Warmup + async cron should respond within seconds
         connect_timeout=10,
         retries={"max_attempts": 0},
     ),
@@ -137,7 +137,7 @@ def get_or_create_session(user_id):
 # AgentCore invocation helpers
 # ---------------------------------------------------------------------------
 
-def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=None):
+def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=None, chat_id=None):
     """Invoke AgentCore Runtime with the given action."""
     payload_dict = {
         "action": action,
@@ -147,6 +147,8 @@ def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=Non
     }
     if message:
         payload_dict["message"] = message
+    if chat_id:
+        payload_dict["chatId"] = chat_id
 
     payload = json.dumps(payload_dict).encode()
 
@@ -578,15 +580,30 @@ def handler(event, context):
         deliver_response(channel, channel_target, error_msg)
         return {"statusCode": 503, "body": "Warmup timeout"}
 
-    # Phase 3: Execute the cron message
+    # Phase 3: Execute the cron message (async — container delivers directly)
     cron_message = f"[Scheduled task: {schedule_name or schedule_id}] {message}"
-    result = invoke_agentcore(session_id, "cron", user_id, actor_id, channel, cron_message)
-    response_text = result.get("response", "No response from scheduled task.")
-    response_files = result.get("files")
+    result = invoke_agentcore(
+        session_id, "cron", user_id, actor_id, channel,
+        cron_message, chat_id=channel_target,
+    )
 
-    # Phase 4: Deliver response to channel
-    logger.info("Delivering response (len=%d) to %s:%s", len(response_text), channel, channel_target)
-    deliver_response(channel, channel_target, response_text, files=response_files)
+    # In async mode the container delivers the response directly to the channel.
+    # The Lambda only needs to confirm the request was accepted.
+    status = result.get("status", "")
+    if status == "accepted":
+        logger.info(
+            "Cron async mode — container will deliver response to %s:%s",
+            channel, channel_target,
+        )
+    else:
+        # Sync fallback (legacy) or error — deliver response from Lambda
+        response_text = result.get("response", "No response from scheduled task.")
+        response_files = result.get("files")
+        logger.info(
+            "Delivering response (len=%d) to %s:%s",
+            len(response_text), channel, channel_target,
+        )
+        deliver_response(channel, channel_target, response_text, files=response_files)
 
     logger.info("Cron execution complete: schedule=%s", schedule_id)
     return {"statusCode": 200, "body": "OK"}

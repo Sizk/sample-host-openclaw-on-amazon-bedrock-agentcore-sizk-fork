@@ -965,15 +965,23 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        // Cron action — blocks until init completes, then processes via custom agent
+        // Cron action — init if needed, then process via custom agent.
+        // If chatId is provided, use async direct delivery (like chat);
+        // otherwise fall back to synchronous response (legacy).
         if (action === "cron") {
-          const { userId, actorId, channel, message } = payload;
+          const { userId, actorId, channel, message, chatId } = payload;
           if (!userId || !actorId || !message) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(
               JSON.stringify({ error: "Missing userId, actorId, or message" }),
             );
             return;
+          }
+
+          // Store channel info for delivery
+          if (chatId) {
+            currentChatId = chatId;
+            currentChannel = channel;
           }
 
           // Block until init completes
@@ -986,6 +994,17 @@ const server = http.createServer(async (req, res) => {
               }
             } catch (err) {
               console.error(`[contract] Cron init failed: ${err.message}`);
+              if (chatId) {
+                const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+                channelSender.deliverResponse(
+                  channel, chatId,
+                  "Your scheduled task could not run because the agent failed to start.",
+                  null, tokens,
+                ).catch((e) => console.error(`[contract] Cron error delivery failed: ${e.message}`));
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ status: "accepted", userId }));
+                return;
+              }
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(
                 JSON.stringify({
@@ -998,6 +1017,17 @@ const server = http.createServer(async (req, res) => {
           }
 
           if (!proxyReady) {
+            if (chatId) {
+              const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+              channelSender.deliverResponse(
+                channel, chatId,
+                "Your scheduled task could not run because the agent is not ready.",
+                null, tokens,
+              ).catch((e) => console.error(`[contract] Cron error delivery failed: ${e.message}`));
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "accepted", userId }));
+              return;
+            }
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
               JSON.stringify({
@@ -1008,7 +1038,20 @@ const server = http.createServer(async (req, res) => {
             return;
           }
 
-          // Process cron message via custom agent
+          // --- Async mode (chatId present): return immediately, deliver in background ---
+          if (chatId) {
+            console.log(`[contract] Cron async mode: chatId=${chatId} channel=${channel}`);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "accepted", userId: currentUserId }));
+
+            // Process and deliver in background (fire-and-forget)
+            processAndDeliver(message, actorId, channel, chatId).catch((err) => {
+              console.error(`[contract] Cron processAndDeliver error: ${err.message}`);
+            });
+            return;
+          }
+
+          // --- Sync mode (no chatId): legacy — block until response ---
           let responseText;
           try {
             responseText = await customAgent.chat(message, actorId, Date.now() + 3600000);
