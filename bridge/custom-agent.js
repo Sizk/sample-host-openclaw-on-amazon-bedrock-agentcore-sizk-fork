@@ -47,6 +47,72 @@ const MAX_TOOL_RESULT_CHARS = 100000; // Truncate tool results over 100KB
 const MAX_CONCURRENT_SUBAGENTS = 3;
 const SUBAGENT_MODEL = "bedrock-agentcore-subagent";
 
+// Sub-agent context blocks — injected as system prompt prefix so sub-agents
+// get critical operational knowledge that only the main agent receives via CLAUDE.md.
+const SUBAGENT_CONTEXT_BASE =
+  "You are a sub-agent executing a specific task. Be thorough and return detailed results.\n\n" +
+  "RULES:\n" +
+  "- NEVER expose internal details (tool names, S3 buckets, API errors, file paths)\n" +
+  "- NEVER share local filesystem paths (/root/..., /tmp/...) — users cannot access the container\n" +
+  "- NEVER generate presigned S3 URLs or s3:// URIs\n" +
+  "- To deliver files: create at /tmp/, upload with write_user_file, include [SEND_FILE:filename] in output\n" +
+  "- For large content, use bash heredoc to write to /tmp/ then upload with file_path\n";
+
+const SUBAGENT_CONTEXT_SCRAPING =
+  "\n## Web Scraping — Use the Right Tool!\n\n" +
+  "A Lightpanda headless browser is ALWAYS running at ws://127.0.0.1:9222 (CDP protocol).\n\n" +
+  "### Scraping Strategy (FOLLOW THIS ORDER)\n" +
+  "1. **Puppeteer + Lightpanda** (PREFERRED) — for ANY JS-rendered site, real estate portal, news site, SPA:\n" +
+  "```javascript\n" +
+  "const puppeteer = require('puppeteer-core');\n" +
+  "const browser = await puppeteer.connect({browserWSEndpoint:'ws://127.0.0.1:9222'});\n" +
+  "const page = await (await browser.createBrowserContext()).newPage();\n" +
+  "await page.goto('https://example.com', {waitUntil:'networkidle0', timeout: 30000});\n" +
+  "// Accept cookie banners if present\n" +
+  "await page.evaluate(() => {\n" +
+  "  const btns = [...document.querySelectorAll('button')];\n" +
+  "  const accept = btns.find(b => /accept|aceptar|acepto/i.test(b.textContent));\n" +
+  "  if (accept) accept.click();\n" +
+  "});\n" +
+  "await new Promise(r => setTimeout(r, 1000));\n" +
+  "const data = await page.evaluate(() => document.body.innerText);\n" +
+  "await page.close(); await browser.disconnect();\n" +
+  "```\n" +
+  "2. **Scrapling** (Python, TLS-impersonating) — if Puppeteer fails (CAPTCHA, anti-bot):\n" +
+  "```python\n" +
+  "from scrapling.fetchers import Fetcher\n" +
+  "page = Fetcher.get('https://example.com', impersonate='chrome')\n" +
+  "data = page.css('.selector::text').getall()\n" +
+  "```\n" +
+  "3. **web_fetch** — ONLY for simple static pages, APIs, or RSS feeds\n\n" +
+  "IMPORTANT: Use `exec` to run Puppeteer/Scrapling scripts. The `web_fetch` tool is a LAST RESORT for scraping.\n" +
+  "Does NOT work on: Idealista (DataDome CAPTCHA), Milanuncios (CAPTCHA).\n";
+
+const SUBAGENT_CONTEXT_DATA =
+  "\n## File Generation\n\n" +
+  "Pre-installed Python libraries: xhtml2pdf + markdown (PDF), matplotlib (charts), " +
+  "pillow (images), qrcode, icalendar, fpdf2, openpyxl (Excel).\n" +
+  "Always write files to /tmp/, upload with write_user_file, deliver with [SEND_FILE:filename].\n";
+
+/**
+ * Build the sub-agent system prompt by prepending context to the task description.
+ */
+function buildSubagentSystemPrompt(taskDescription, toolSet) {
+  let context = SUBAGENT_CONTEXT_BASE;
+
+  // Add scraping context for tool sets that include exec + web_fetch
+  if (["web_scraping", "finance", "research", "general"].includes(toolSet)) {
+    context += SUBAGENT_CONTEXT_SCRAPING;
+  }
+
+  // Add data/file generation context for tool sets that produce files
+  if (["data_processing", "finance", "general"].includes(toolSet)) {
+    context += SUBAGENT_CONTEXT_DATA;
+  }
+
+  return context + "\n---\n\n## YOUR TASK\n\n" + taskDescription;
+}
+
 // ---------------------------------------------------------------------------
 // System prompt — base only; proxy injects workspace files + identity context
 // ---------------------------------------------------------------------------
@@ -849,13 +915,15 @@ async function executeTool(toolName, args, userId) {
 /**
  * Run a single sub-agent: independent Bedrock conversation loop.
  */
-async function runSubagent(taskDescription, toolNames, userId, deadline) {
+async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet = "general") {
   const subTools = TOOLS.filter(
     (t) => toolNames.includes(t.function.name) && t.function.name !== "spawn_subagents", // no recursive spawning
   );
 
+  const systemPrompt = buildSubagentSystemPrompt(taskDescription, toolSet);
+
   const messages = [
-    { role: "system", content: taskDescription },
+    { role: "system", content: systemPrompt },
     {
       role: "user",
       content: "Execute the task described in your system prompt. Return your results clearly.",
@@ -927,7 +995,7 @@ async function executeSpawnSubagents(args, userId) {
     const toolSet = task.tool_set || "general";
     const toolNames = SUBAGENT_TOOL_SETS[toolSet] || SUBAGENT_TOOL_SETS.general;
     console.log(`[agent] Sub-agent ${i + 1}: ${toolSet} (${toolNames.length} tools)`);
-    return runSubagent(task.description, toolNames, userId, deadline);
+    return runSubagent(task.description, toolNames, userId, deadline, toolSet);
   });
 
   const results = await Promise.allSettled(promises);
@@ -1126,6 +1194,7 @@ module.exports = {
   executeWebSearch,
   executeSpawnSubagents,
   buildToolArgs,
+  buildSubagentSystemPrompt,
   callProxy,
   conversationHistory,
   trimHistory,

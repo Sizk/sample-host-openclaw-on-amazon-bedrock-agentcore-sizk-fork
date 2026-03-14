@@ -491,6 +491,97 @@ describe("SUBAGENT_TOOL_SETS", () => {
 });
 
 // ---------------------------------------------------------------------------
+// buildSubagentSystemPrompt
+// ---------------------------------------------------------------------------
+
+describe("buildSubagentSystemPrompt", () => {
+  it("is a function", () => {
+    assert.equal(typeof agent.buildSubagentSystemPrompt, "function");
+  });
+
+  it("always includes base context and task description", () => {
+    const result = agent.buildSubagentSystemPrompt("Scrape fotocasa.es", "web_scraping");
+    assert.ok(result.includes("You are a sub-agent"), "has sub-agent identity");
+    assert.ok(result.includes("NEVER expose internal details"), "has internal details rule");
+    assert.ok(result.includes("[SEND_FILE:filename]"), "has file delivery rule");
+    assert.ok(result.includes("Scrape fotocasa.es"), "has task description");
+    assert.ok(result.includes("YOUR TASK"), "has task header");
+  });
+
+  it("includes scraping context for web_scraping tool set", () => {
+    const result = agent.buildSubagentSystemPrompt("Scrape site", "web_scraping");
+    assert.ok(result.includes("ws://127.0.0.1:9222"), "has Lightpanda endpoint");
+    assert.ok(result.includes("puppeteer"), "has Puppeteer reference");
+    assert.ok(result.includes("Scrapling"), "has Scrapling reference");
+    assert.ok(result.includes("FOLLOW THIS ORDER"), "has strategy ordering");
+  });
+
+  it("includes scraping context for research tool set", () => {
+    const result = agent.buildSubagentSystemPrompt("Research topic", "research");
+    assert.ok(result.includes("ws://127.0.0.1:9222"), "research gets scraping context");
+    assert.ok(result.includes("Puppeteer"), "research gets Puppeteer");
+  });
+
+  it("includes scraping context for finance tool set", () => {
+    const result = agent.buildSubagentSystemPrompt("Get stock data", "finance");
+    assert.ok(result.includes("ws://127.0.0.1:9222"), "finance gets scraping context");
+  });
+
+  it("includes scraping context for general tool set", () => {
+    const result = agent.buildSubagentSystemPrompt("Do stuff", "general");
+    assert.ok(result.includes("ws://127.0.0.1:9222"), "general gets scraping context");
+  });
+
+  it("does NOT include scraping context for data_processing", () => {
+    const result = agent.buildSubagentSystemPrompt("Process CSV", "data_processing");
+    assert.ok(!result.includes("ws://127.0.0.1:9222"), "data_processing has no scraping");
+    assert.ok(!result.includes("Puppeteer"), "data_processing has no Puppeteer");
+  });
+
+  it("includes data/file context for data_processing", () => {
+    const result = agent.buildSubagentSystemPrompt("Make chart", "data_processing");
+    assert.ok(result.includes("matplotlib"), "data_processing has matplotlib");
+    assert.ok(result.includes("openpyxl"), "data_processing has openpyxl");
+  });
+
+  it("includes data/file context for finance", () => {
+    const result = agent.buildSubagentSystemPrompt("Chart portfolio", "finance");
+    assert.ok(result.includes("matplotlib"), "finance gets file generation context");
+  });
+
+  it("includes data/file context for general", () => {
+    const result = agent.buildSubagentSystemPrompt("Generate report", "general");
+    assert.ok(result.includes("matplotlib"), "general gets file generation context");
+  });
+
+  it("does NOT include data/file context for web_scraping", () => {
+    const result = agent.buildSubagentSystemPrompt("Scrape site", "web_scraping");
+    assert.ok(!result.includes("matplotlib"), "web_scraping has no file generation context");
+  });
+
+  it("does NOT include data/file context for research", () => {
+    const result = agent.buildSubagentSystemPrompt("Research topic", "research");
+    assert.ok(!result.includes("matplotlib"), "research has no file generation context");
+  });
+
+  it("task description appears at the end after separator", () => {
+    const result = agent.buildSubagentSystemPrompt("My specific task here", "general");
+    const taskIdx = result.indexOf("My specific task here");
+    const sepIdx = result.indexOf("YOUR TASK");
+    assert.ok(sepIdx < taskIdx, "separator comes before task");
+    assert.ok(sepIdx > 0, "separator exists");
+  });
+
+  it("defaults gracefully for unknown tool set (base context only)", () => {
+    const result = agent.buildSubagentSystemPrompt("Unknown set task", "unknown_set");
+    assert.ok(result.includes("You are a sub-agent"), "has base context");
+    assert.ok(result.includes("Unknown set task"), "has task description");
+    assert.ok(!result.includes("ws://127.0.0.1:9222"), "no scraping for unknown set");
+    assert.ok(!result.includes("matplotlib"), "no file gen for unknown set");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // setExecEnv
 // ---------------------------------------------------------------------------
 
