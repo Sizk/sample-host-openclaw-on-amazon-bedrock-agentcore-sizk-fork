@@ -78,11 +78,11 @@ Beyond microVM isolation, S3 access is restricted at the **IAM level** using STS
 
 1. On container init, the contract server calls `STS:AssumeRole` on its own execution role with an inline session policy
 2. The session policy restricts S3 to `{bucket}/{namespace}/*` — the user can only access their own prefix
-3. OpenClaw is spawned with these scoped credentials via `credential_process`. Container-level credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CONTAINER_CREDENTIALS_*`) are stripped from its environment
+3. The custom agent is spawned with these scoped credentials via `credential_process`. Container-level credentials (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_CONTAINER_CREDENTIALS_*`) are stripped from its environment
 4. Credentials are refreshed every 45 minutes (STS max session duration is 1 hour)
 5. The trusted proxy process retains full execution role credentials for Bedrock, Cognito, and S3 image access (with application-level namespace enforcement)
 
-This provides defense-in-depth: even if OpenClaw's bash tool or a skill attempts to access another user's S3 prefix, the IAM session policy denies the request. The session policy also scopes DynamoDB access to the identity table and EventBridge access to the cron schedule group.
+This provides defense-in-depth: even if the custom agent's bash tool or a skill attempts to access another user's S3 prefix, the IAM session policy denies the request. The session policy also scopes DynamoDB access to the identity table and EventBridge access to the cron schedule group.
 
 ### Identity Management
 
@@ -133,7 +133,7 @@ All sensitive values are stored in **AWS Secrets Manager** encrypted with a cust
 | `openclaw/channels/telegram` | Telegram bot token |
 | `openclaw/channels/slack` | Slack bot token + signing secret (JSON) |
 | `openclaw/webhook-secret` | Webhook validation token |
-| `openclaw/gateway-token` | OpenClaw gateway authentication |
+| `openclaw/gateway-token` | Agent gateway authentication |
 | `openclaw/cognito-secret` | HMAC secret for password derivation |
 
 Secrets are:

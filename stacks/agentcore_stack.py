@@ -1,9 +1,8 @@
-"""AgentCore Stack — Hosts OpenClaw on AgentCore Runtime.
+"""AgentCore Stack — Hosts the messaging bridge on AgentCore Runtime.
 
-Deploys the OpenClaw messaging bridge as a container on AgentCore Runtime.
+Deploys the messaging bridge as a container on AgentCore Runtime.
 The container runs an AgentCore contract server on port 8080, a Bedrock
-proxy on port 18790, and OpenClaw gateway on port 18789 (started lazily
-per user session).
+proxy on port 18790, and a custom agent (started lazily per user session).
 """
 
 from aws_cdk import (
@@ -45,7 +44,7 @@ class AgentCoreStack(Stack):
         region = Stack.of(self).region
         account = Stack.of(self).account
 
-        # --- ECR Repository for OpenClaw bridge image -------------------------
+        # --- ECR Repository for bridge image ----------------------------------
         self.bridge_repo = ecr.Repository(
             self,
             "BridgeRepo",
@@ -221,7 +220,7 @@ class AgentCoreStack(Stack):
         subagent_model_id = self.node.try_get_context("subagent_model_id") or ""
         image_version = str(self.node.try_get_context("image_version") or "1")
 
-        # --- AgentCore Runtime (hosts OpenClaw container) ---------------------
+        # --- AgentCore Runtime (hosts bridge container) -----------------------
         self.runtime = agentcore.CfnRuntime(
             self,
             "AgentRuntime",
@@ -271,7 +270,7 @@ class AgentCoreStack(Stack):
                 "TELEGRAM_TOKEN_SECRET_ID": telegram_token_secret_name,
                 "SLACK_TOKEN_SECRET_ID": slack_token_secret_name,
             },
-            description="OpenClaw messaging bridge on AgentCore Runtime (per-user sessions)",
+            description="Messaging bridge on AgentCore Runtime (per-user sessions)",
             lifecycle_configuration=agentcore.CfnRuntime.LifecycleConfigurationProperty(
                 # Per-user sessions: idle timeout allows natural termination when
                 # user stops chatting. Container returns Healthy (not HealthyBusy).

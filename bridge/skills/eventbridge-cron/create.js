@@ -125,7 +125,7 @@ async function main() {
         RoleArn: EVENTBRIDGE_ROLE_ARN,
         Input: lambdaInput,
       },
-      Description: `OpenClaw cron: ${scheduleName || message.slice(0, 100)}`,
+      Description: `Scheduled cron: ${scheduleName || message.slice(0, 100)}`,
     }));
   } catch (err) {
     console.error(`Error creating schedule: ${err.message}`);

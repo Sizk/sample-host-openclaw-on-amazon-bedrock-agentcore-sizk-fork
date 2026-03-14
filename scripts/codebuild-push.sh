@@ -32,14 +32,13 @@ echo "==> Image version: v${IMAGE_VERSION}"
 echo "==> Source bucket: s3://${SOURCE_BUCKET}/bridge-source.zip"
 echo ""
 
-# --- Pre-flight: validate OpenClaw config ------------------------------------
-echo "==> Running config validation test ..."
-(cd "$BRIDGE_DIR" && node --test config-validation.test.js) || {
-	echo "    CONFIG VALIDATION FAILED — aborting build."
-	echo "    Fix the config in openclaw-config.js and re-run."
+# --- Pre-flight: run custom agent tests --------------------------------------
+echo "==> Running custom agent tests ..."
+(cd "$BRIDGE_DIR" && node --test custom-agent.test.js) || {
+	echo "    TESTS FAILED — aborting build."
 	exit 1
 }
-echo "    Config validation passed."
+echo "    Tests passed."
 echo ""
 
 # --- Package bridge/ source --------------------------------------------------

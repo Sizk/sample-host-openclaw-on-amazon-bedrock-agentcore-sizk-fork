@@ -1,4 +1,4 @@
-# OpenClaw on AgentCore — Solution Architecture
+# Custom Agent on AgentCore — Solution Architecture
 
 ## High-Level Architecture
 
@@ -43,11 +43,11 @@
 |          |                             |                                                   |
 |  +-------v--------+          +--------v---------+                                         |
 |  | DynamoDB       |          | Secrets Manager   |                                         |
-|  | (identity)     |          | - gateway-token   |                                         |
-|  |                |          | - webhook-secret  |                                         |
-|  | CHANNEL# items |          | - cognito-password|                                         |
-|  | USER# items    |          | - channels/*      |                                         |
-|  | SESSION items  |          +-------------------+                                         |
+|  | (identity)     |          | - webhook-secret  |                                         |
+|  |                |          | - cognito-password|                                         |
+|  | CHANNEL# items |          | - channels/*      |                                         |
+|  | USER# items    |          +-------------------+                                         |
+|  | SESSION items  |                                                                        |
 |  | BIND# items    |                                                                        |
 |  | ALLOW# items   |                                                                        |
 |  | CRON# items    |                                                                        |
@@ -69,12 +69,12 @@
 |  |  |  |  (per-user microVM — managed serverless) |  |                                    |
 |  |  |  |                                          |  |                                    |
 |  |  |  |  +--------------+  +-----------------+   |  |                                    |
-|  |  |  |  | agentcore-   |  | OpenClaw        |   |  |                                    |
-|  |  |  |  | contract.js  |  | Gateway         |   |  |                                    |
-|  |  |  |  | (port 8080)  |  | (port 18789)    |   |  |                                    |
-|  |  |  |  | - /ping      |  | - headless mode |   |  |                                    |
-|  |  |  |  | - /invoke    |  | - no channels   |   |  |                                    |
-|  |  |  |  | - WS bridge  |  | - tools & skills|   |  |                                    |
+|  |  |  |  | agentcore-   |  | custom-         |   |  |                                    |
+|  |  |  |  | contract.js  |  | agent.js        |   |  |                                    |
+|  |  |  |  | (port 8080)  |  | (14 tools)      |   |  |                                    |
+|  |  |  |  | - /ping      |  | - web scraping  |   |  |                                    |
+|  |  |  |  | - /invoke    |  | - file storage  |   |  |                                    |
+|  |  |  |  |              |  | - cron sched.   |   |  |                                    |
 |  |  |  |  +--------------+  +--------+--------+   |  |                                    |
 |  |  |  |                             |            |  |                                    |
 |  |  |  |                    +--------v--------+   |  |                                    |
@@ -140,15 +140,15 @@
   First /invocations {action: "chat"}:
     1. Restore .openclaw/ from S3  (workspace-sync.js)
     2. Start agentcore-proxy.js (port 18790) with USER_ID env
-    3. Write headless OpenClaw config (no channels)
-    4. Start OpenClaw gateway (port 18789, ~4 min startup)
-    5. Start periodic workspace saves (every 5 min)
+    3. Start custom-agent.js with scoped credentials
+    4. Start periodic workspace saves (every 5 min)
+    5. Wait for proxy + custom agent ready (~5s)
          |
          v
-  WebSocket bridge: auth -> chat.send -> streaming deltas -> final
+   Custom agent handles messages via proxy → Bedrock ConverseStream (14 tools)
          |
          v
-  Router Lambda sends response to Telegram via sendMessage API
+   Response sent directly to Telegram/Slack via channel-sender.js
          |
          v
   (Subsequent messages reuse the warm microVM — fast response)
@@ -182,13 +182,12 @@
 |    |   1. Fetch secrets from Secrets Manager                         |
 |    |   2. Restore .openclaw/ from S3 (workspace-sync.js)             |
 |    |   3. Start agentcore-proxy.js (port 18790)                      |
-|    |   4. Write headless OpenClaw config (no channels)               |
-|    |   5. Start OpenClaw gateway (port 18789) — ~4 min startup       |
-|    |   6. Start periodic workspace saves                              |
+|    |   4. Start custom-agent.js with scoped credentials              |
+|    |   5. Start periodic workspace saves                              |
+|    |   6. Wait for proxy + custom agent ready (~5s)                  |
 |    |                                                                  |
 |    |-- On subsequent chats:                                          |
-|    |   WebSocket bridge to OpenClaw:                                 |
-|    |   connect -> auth(token) -> chat.send -> deltas -> final        |
+|    |   Route to custom-agent.js                                      |
 |    |                                                                  |
 |    |-- On SIGTERM:                                                   |
 |        Save .openclaw/ to S3 -> kill children -> exit                |
@@ -200,10 +199,11 @@
 |    |-- Cognito auto-provisioning (HMAC passwords)                     |
 |    |-- Per-user workspace files (AGENTS.md, SOUL.md, etc.)            |
 |                                                                       |
-|  OpenClaw Gateway (port 18789) — headless mode                        |
-|    |-- No channel connections (messages bridged via WebSocket)         |
-|    |-- Full tool profile (web, filesystem, runtime, sessions, etc.)   |
-|    |-- 2 custom skills (s3-user-files, eventbridge-cron)              |
+|  custom-agent.js — 14 built-in tools                                  |
+|    |-- Web: web_fetch, web_search (Lightpanda + Scrapling)            |
+|    |-- Files: read/write/list/delete via s3-user-files skill          |
+|    |-- Cron: create/list/update/delete via eventbridge-cron skill     |
+|    |-- Sub-agent support                                              |
 |                                                                       |
 |  NODE_OPTIONS: --dns-result-order=ipv4first                           |
 |                --no-network-family-autoselection                       |
@@ -361,7 +361,7 @@
 | Network | VPC + private subnets | Container runs in private subnets, egress via NAT |
 | Network | VPC endpoints (7) | Bedrock, ECR, Secrets Manager, Logs, Metrics, SSM, S3 |
 | Encryption | KMS CMK | All secrets encrypted with customer-managed key |
-| Secrets | Secrets Manager | 7 secrets: gateway token, webhook secret, cognito HMAC, 4 channel tokens |
+| Secrets | Secrets Manager | Webhook secret, cognito HMAC, channel tokens |
 | Identity | DynamoDB | Channel-to-user mapping, cross-channel binding, session management |
 | Identity | Cognito User Pool | Auto-provisioned users with HMAC-derived passwords |
 | IAM | Least privilege | cdk-nag AwsSolutions checks enforced at synth |

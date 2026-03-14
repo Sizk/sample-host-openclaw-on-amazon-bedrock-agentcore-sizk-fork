@@ -2,7 +2,7 @@
  * Tests for scoped-credentials.js — STS session-scoped S3 credentials.
  *
  * Covers: buildSessionPolicy, createScopedCredentials, writeCredentialFiles,
- *         buildOpenClawEnv, credential refresh lifecycle.
+ *         credential refresh lifecycle.
  * Run: cd bridge && node --test scoped-credentials.test.js
  */
 const { describe, it, beforeEach, afterEach, mock } = require("node:test");
@@ -493,105 +493,5 @@ describe("writeCredentialFiles", () => {
     // Both final files should exist
     assert.ok(files.includes("scoped-creds.json"), "scoped-creds.json should exist");
     assert.ok(files.includes("scoped-aws-config"), "scoped-aws-config should exist");
-  });
-});
-
-// --- buildOpenClawEnv ---
-
-describe("buildOpenClawEnv", () => {
-  let buildOpenClawEnv;
-
-  beforeEach(() => {
-    delete require.cache[require.resolve("./scoped-credentials")];
-    ({ buildOpenClawEnv } = require("./scoped-credentials"));
-  });
-
-  it("includes AWS_CONFIG_FILE pointing to scoped config", () => {
-    const env = buildOpenClawEnv({ credDir: "/tmp/scoped" });
-    assert.equal(env.AWS_CONFIG_FILE, "/tmp/scoped/scoped-aws-config");
-  });
-
-  it("includes AWS_SDK_LOAD_CONFIG=1", () => {
-    const env = buildOpenClawEnv({ credDir: "/tmp/scoped" });
-    assert.equal(env.AWS_SDK_LOAD_CONFIG, "1");
-  });
-
-  it("does NOT include AWS_ACCESS_KEY_ID", () => {
-    const env = buildOpenClawEnv({ credDir: "/tmp/scoped" });
-    assert.equal(env.AWS_ACCESS_KEY_ID, undefined);
-  });
-
-  it("does NOT include AWS_SECRET_ACCESS_KEY", () => {
-    const env = buildOpenClawEnv({ credDir: "/tmp/scoped" });
-    assert.equal(env.AWS_SECRET_ACCESS_KEY, undefined);
-  });
-
-  it("does NOT include AWS_SESSION_TOKEN", () => {
-    const env = buildOpenClawEnv({ credDir: "/tmp/scoped" });
-    assert.equal(env.AWS_SESSION_TOKEN, undefined);
-  });
-
-  it("does NOT include AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", () => {
-    const env = buildOpenClawEnv({ credDir: "/tmp/scoped" });
-    assert.equal(env.AWS_CONTAINER_CREDENTIALS_RELATIVE_URI, undefined);
-  });
-
-  it("does NOT include AWS_CONTAINER_CREDENTIALS_FULL_URI", () => {
-    const env = buildOpenClawEnv({ credDir: "/tmp/scoped" });
-    assert.equal(env.AWS_CONTAINER_CREDENTIALS_FULL_URI, undefined);
-  });
-
-  it("includes standard env vars (PATH, HOME, NODE_OPTIONS, AWS_REGION)", () => {
-    const env = buildOpenClawEnv({
-      credDir: "/tmp/scoped",
-      baseEnv: {
-        PATH: "/usr/bin",
-        HOME: "/root",
-        NODE_OPTIONS: "--dns-result-order=ipv4first",
-        AWS_REGION: "us-west-2",
-      },
-    });
-    assert.equal(env.PATH, "/usr/bin");
-    assert.equal(env.HOME, "/root");
-    assert.equal(env.AWS_REGION, "us-west-2");
-  });
-
-  it("includes S3_USER_FILES_BUCKET from baseEnv", () => {
-    const env = buildOpenClawEnv({
-      credDir: "/tmp/scoped",
-      baseEnv: { S3_USER_FILES_BUCKET: "my-bucket" },
-    });
-    assert.equal(env.S3_USER_FILES_BUCKET, "my-bucket");
-  });
-
-  it("includes EventBridge cron env vars from baseEnv", () => {
-    const env = buildOpenClawEnv({
-      credDir: "/tmp/scoped",
-      baseEnv: {
-        EVENTBRIDGE_SCHEDULE_GROUP: "openclaw-cron",
-        IDENTITY_TABLE_NAME: "openclaw-identity",
-        CRON_LAMBDA_ARN: "arn:aws:lambda:us-west-2:123:function:cron",
-        EVENTBRIDGE_ROLE_ARN: "arn:aws:iam::123:role/scheduler",
-        CRON_LEAD_TIME_MINUTES: "5",
-      },
-    });
-    assert.equal(env.EVENTBRIDGE_SCHEDULE_GROUP, "openclaw-cron");
-    assert.equal(env.IDENTITY_TABLE_NAME, "openclaw-identity");
-    assert.equal(env.CRON_LAMBDA_ARN, "arn:aws:lambda:us-west-2:123:function:cron");
-    assert.equal(env.EVENTBRIDGE_ROLE_ARN, "arn:aws:iam::123:role/scheduler");
-    assert.equal(env.CRON_LEAD_TIME_MINUTES, "5");
-  });
-
-  it("includes OPENCLAW_SKIP_CRON=1", () => {
-    const env = buildOpenClawEnv({ credDir: "/tmp/scoped" });
-    assert.equal(env.OPENCLAW_SKIP_CRON, "1");
-  });
-
-  it("includes SUBAGENT_BEDROCK_MODEL_ID from baseEnv", () => {
-    const env = buildOpenClawEnv({
-      credDir: "/tmp/scoped",
-      baseEnv: { SUBAGENT_BEDROCK_MODEL_ID: "global.anthropic.claude-sonnet-4-6-v1" },
-    });
-    assert.equal(env.SUBAGENT_BEDROCK_MODEL_ID, "global.anthropic.claude-sonnet-4-6-v1");
   });
 });

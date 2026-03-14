@@ -168,7 +168,7 @@ describe("health endpoint shape", () => {
   });
 });
 
-describe("contract writeOpenClawConfig subagent model", () => {
+describe("contract subagent model routing", () => {
   it("subagent model name is distinct from main model", () => {
     // The contract sets subagentModel = "agentcore/bedrock-agentcore-subagent"
     const SUBAGENT_MODEL_NAME_CONTRACT = "bedrock-agentcore-subagent";

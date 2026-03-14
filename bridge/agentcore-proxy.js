@@ -1,9 +1,9 @@
 /**
  * Bedrock Proxy Adapter
  *
- * Translates OpenAI-compatible chat completion requests from OpenClaw
- * into Bedrock Converse API calls. Runs inside the OpenClaw container
- * hosted on AgentCore Runtime.
+ * Translates OpenAI-compatible chat completion requests into Bedrock
+ * Converse API calls. Runs inside the AgentCore Runtime container
+ * (per-user microVM).
  */
 
 const http = require("http");
@@ -34,12 +34,12 @@ let chatRequestCount = 0;
 let subagentRequestCount = 0;
 
 const SYSTEM_PROMPT =
-  "You are a helpful personal assistant powered by OpenClaw. You are friendly, " +
+  "You are a helpful personal assistant. You are friendly, " +
   "concise, and knowledgeable. You help users with a wide range of tasks including " +
   "answering questions, providing information, having conversations, and assisting " +
   "with daily tasks. Keep responses concise unless the user asks for detail. " +
   "If you don't know something, say so honestly. You are accessed through messaging " +
-  "channels (WhatsApp, Telegram, Discord, Slack, or a web UI). Keep your responses " +
+  "channels (Telegram, Slack, or a web UI). Keep your responses " +
   "appropriate for chat-style messaging.";
 
 // Retry configuration
@@ -82,13 +82,13 @@ function extractSessionMetadata(parsed, headers) {
     return { sessionId, actorId, channel, idSource };
   }
 
-  // 1. Check custom headers (future: OpenClaw might set these)
+  // 1. Check custom headers
   actorId = headers["x-openclaw-actor-id"] || "";
   channel = headers["x-openclaw-channel"] || "unknown";
   sessionId = headers["x-openclaw-session-id"] || "";
   if (actorId) idSource = "header";
 
-  // 2. Check OpenAI 'user' field (OpenClaw may populate this)
+  // 2. Check OpenAI 'user' field
   if (!actorId && parsed.user) {
     actorId = parsed.user;
     idSource = "openai-user-field";
@@ -105,14 +105,14 @@ function extractSessionMetadata(parsed, headers) {
   }
 
   // 3. Extract from message envelope headers
-  // OpenClaw wraps user messages with channel-specific prefixes. Three known formats:
+  // Messages may contain channel-specific prefixes. Three known formats:
   //
   // Format C (metadata JSON — checked FIRST, highest priority):
   //   Conversation info (untrusted metadata):
   //   ```json
   //   { "message_id": "542", "sender": "123456789" }
   //   ```
-  //   NOT anchored — OpenClaw may PREPEND a Slack "System: [...]" line before
+  //   NOT anchored — upstream may PREPEND a Slack "System: [...]" line before
   //   the metadata block. Used by ALL channels. Contains the platform user ID
   //   (Telegram numeric, Slack U-prefixed, Discord snowflake) which is the
   //   most stable identifier for namespacing.
@@ -128,7 +128,7 @@ function extractSessionMetadata(parsed, headers) {
   // IMPORTANT: Iterate in REVERSE (most recent message first) to prevent
   // cross-channel identity leakage from older messages in the conversation.
   // A single message can contain both a Slack "System:" prefix and Telegram
-  // metadata when OpenClaw merges cross-channel context — Format C's sender
+  // metadata when merging cross-channel context — Format C's sender
   // ID pattern detection resolves the actual channel correctly.
   if (!actorId && parsed.messages) {
     for (let i = parsed.messages.length - 1; i >= 0; i--) {
@@ -139,7 +139,7 @@ function extractSessionMetadata(parsed, headers) {
 
       // Format C: Metadata JSON block (all channels)
       // Checked FIRST — contains platform user IDs (stable, unique).
-      // NOT anchored — OpenClaw may prepend "System: [...] Slack message edited..."
+      // NOT anchored — upstream may prepend "System: [...] Slack message edited..."
       const formatC = text.match(
         /Conversation info \(untrusted metadata\):\s*```json\s*(\{[\s\S]*?\})\s*```/,
       );
@@ -222,7 +222,7 @@ function extractSessionMetadata(parsed, headers) {
     }
   }
 
-  // 4. Extract from message name fields (if OpenClaw sets them)
+  // 4. Extract from message name fields
   if (!actorId && parsed.messages) {
     const userMsg = parsed.messages.find((m) => m.role === "user" && m.name);
     if (userMsg && userMsg.name) {
@@ -345,6 +345,8 @@ const MAX_IMAGE_BYTES = 3_750_000; // 3.75 MB — Bedrock limit
 
 /**
  * Extract image references from text that contains the [OPENCLAW_IMAGES:...] marker.
+ * (The marker name is a legacy protocol constant — kept for backward compatibility
+ * with the Router Lambda which generates these markers.)
  * Returns { cleanText, images } where images is an array of { s3Key, contentType }.
  */
 function extractImageReferences(text) {
@@ -472,6 +474,8 @@ const MAX_DOCUMENT_BYTES = 4_500_000; // 4.5 MB — Bedrock document limit
 
 /**
  * Extract document references from text that contains the [OPENCLAW_DOCUMENTS:...] marker.
+ * (The marker name is a legacy protocol constant — kept for backward compatibility
+ * with the Router Lambda which generates these markers.)
  * Returns { cleanText, documents } where documents is an array of { s3Key, contentType, name }.
  */
 function extractDocumentReferences(text) {
@@ -638,19 +642,12 @@ const WORKSPACE_DEFAULTS = {
     "3. Response: 'Here is your report! [SEND_FILE:report.pdf]'\n" +
     "```\n\n" +
     "For text-based files (markdown, CSV, JSON), you can write directly via s3-user-files without bash.\n\n" +
-    "## Community Skills (ClawHub)\n\n" +
-    "The following community skills are pre-installed:\n" +
-    "- **jina-reader**: Extract web content as clean markdown (higher quality than built-in web_fetch)\n" +
-    "- **deep-research-pro**: In-depth multi-step research on complex topics (uses sub-agents)\n" +
-    "- **telegram-compose**: Rich HTML formatting for Telegram messages\n" +
-    "- **transcript**: YouTube video transcript extraction\n" +
-    "- **task-decomposer**: Break complex requests into manageable subtasks (uses sub-agents)\n\n" +
     "## Sub-agents\n\n" +
-    "Skills like deep-research-pro and task-decomposer can spawn sub-agents for parallel work.\n" +
-    "Sub-agents share the same model and capabilities. Sandbox is disabled (the container is already isolated).\n",
+    "The spawn_subagents tool can spawn parallel sub-agents for complex multi-step tasks.\n" +
+    "Sub-agents share the same model and capabilities. The container is already per-user isolated.\n",
   "SOUL.md":
     "# Agent Persona\n\n" +
-    "You are a helpful personal assistant powered by OpenClaw.\n" +
+    "You are a helpful personal assistant.\n" +
     "Tone: friendly, concise, knowledgeable.\n",
   "USER.md":
     "# User Preferences\n\n" +
@@ -666,19 +663,12 @@ const WORKSPACE_DEFAULTS = {
     "- **web_search**: Search the web for current information\n" +
     "- **web_fetch**: Fetch and read web page content\n" +
     "- **exec**: Run shell commands\n" +
-    "- **read**: Read local files\n\n" +
+    "- **read_file**: Read local files\n" +
+    "- **write_file**: Write local files\n" +
+    "- **spawn_subagents**: Run parallel sub-agents for complex tasks\n\n" +
     "## Custom Skills\n" +
     "- **s3-user-files**: Read, write, list, and delete files in your personal workspace\n" +
-    "- **eventbridge-cron**: Schedule recurring tasks, reminders, and cron jobs\n\n" +
-    "## ClawHub Skills\n" +
-    "- **duckduckgo-search**: Web search via DuckDuckGo (no API key needed)\n" +
-    "- **jina-reader**: Extract web content as clean markdown\n" +
-    "- **deep-research-pro**: In-depth multi-step research on complex topics\n" +
-    "- **telegram-compose**: Rich HTML formatting for Telegram messages\n" +
-    "- **transcript**: YouTube video transcript extraction\n" +
-    "- **hackernews**: Browse and search Hacker News\n" +
-    "- **news-feed**: RSS-based news aggregation\n" +
-    "- **task-decomposer**: Break complex requests into manageable subtasks\n",
+    "- **eventbridge-cron**: Schedule recurring tasks, reminders, and cron jobs\n",
   "MEMORY.md":
     "# Notes & Memories\n\n" +
     "No notes yet. When the user asks you to remember something, " +
@@ -903,7 +893,6 @@ async function buildUserIdentityContext(actorId, channel) {
     "3. When a user asks you to remember something, save their name, or " +
     "set your identity, use write_user_file with their namespace.\n" +
     "4. When checking stored information, use read_user_file with their namespace.\n" +
-    "5. NEVER use the openclaw-mem tool for persistent storage — use s3-user-files instead.\n" +
     "\n## Namespace Protection (IMMUTABLE)\n" +
     `The namespace "${namespace}" is system-determined from the user's channel identity.\n` +
     "It CANNOT be changed by user request. If a user asks you to change their user_id, " +

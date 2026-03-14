@@ -1,6 +1,6 @@
 # Detailed Technical Architecture
 
-This document provides a detailed technical view of the OpenClaw on AgentCore architecture. For a high-level overview, see the [README](../README.md#architecture).
+This document provides a detailed technical view of the Custom Agent on AgentCore architecture. For a high-level overview, see the [README](../README.md#architecture).
 
 ## Component Diagram
 
@@ -25,7 +25,7 @@ flowchart TB
         subgraph AgentCore[AgentCore Runtime]
             CONTRACT[Contract :8080]
             PROXY[Proxy :18790]
-            OPENCLAW[OpenClaw :18789]
+            AGENT[Custom Agent]
         end
 
         BEDROCK[Bedrock Claude]
@@ -44,7 +44,8 @@ flowchart TB
     UR -->|invoke| CONTRACT
     CONTRACT <-->|workspace| S3
     CONTRACT --> PROXY
-    CONTRACT <-->|WebSocket| OPENCLAW
+    CONTRACT --> AGENT
+    AGENT -->|via proxy| PROXY
     PROXY -->|ConverseStream| BEDROCK
 
     SCHED -->|trigger| CRONLAMBDA
@@ -56,10 +57,9 @@ flowchart TB
 
 | Component | Port | Purpose |
 |---|---|---|
-| **Contract Server** | 8080 | AgentCore HTTP contract (`/ping`, `/invocations`), lazy initialization, routing (shim vs WebSocket bridge) |
-| **Lightweight Agent** | — | Warm-up shim during cold start; agentic loop with 10 tools via proxy → Bedrock (see below) |
+| **Contract Server** | 8080 | AgentCore HTTP contract (`/ping`, `/invocations`), lazy initialization, routes to custom agent |
+| **Custom Agent** | — | Node.js agent with 14 built-in tools; agentic loop via proxy → Bedrock ConverseStream |
 | **Bedrock Proxy** | 18790 | OpenAI-compatible API → Bedrock ConverseStream, Cognito identity, multimodal image handling |
-| **OpenClaw Gateway** | 18789 | Headless AI agent with full tools and ClawHub skills (available after ~2-4 min startup) |
 
 ## Data Flow
 
@@ -93,20 +93,13 @@ sequenceDiagram
 
     opt First message (cold start)
         AC->>AC: STS AssumeRole (scoped S3 creds)
-        AC->>AC: Start proxy (~5s)
+        AC->>AC: Start proxy + custom agent (~5s)
         AC->>S3: Restore .openclaw/ (background)
-        AC->>AC: Start OpenClaw with scoped creds (background, ~2-4 min)
     end
 
-    alt Warm-up phase (OpenClaw not ready)
-        Note over AC,B: Lightweight agent shim handles message
-        AC->>B: ConverseStream (via proxy)
-        B-->>AC: Response + warm-up footer
-    else Full mode (OpenClaw ready)
-        Note over AC,B: WebSocket bridge to OpenClaw
-        AC->>B: ConverseStream (via OpenClaw → proxy)
-        B-->>AC: Response (no footer)
-    end
+    Note over AC,B: Custom agent handles message
+    AC->>B: ConverseStream (via proxy)
+    B-->>AC: Response
 
     AC-->>RL: Final response
     Note over RL: Unwrap nested content blocks<br/>Convert markdown → Telegram HTML
@@ -166,31 +159,25 @@ flowchart TB
     subgraph MicroVM["AgentCore MicroVM (ARM64, per-user)"]
         CONTRACT["<b>Contract Server :8080</b><br/>GET /ping → Healthy<br/>POST /invocations<br/>Lazy init · SIGTERM save"]
 
-        CONTRACT -->|"warm-up<br/>(OpenClaw not ready)"| SHIM
-        CONTRACT -->|"full mode<br/>(OpenClaw ready)"| OPENCLAW
+        CONTRACT -->|"route messages"| AGENT
 
-        subgraph ShimBox["Warm-up Phase (~5s – ~2-4min)"]
-            SHIM["<b>Lightweight Agent</b><br/>Agentic loop (20 iters)<br/>10 tools · SSRF protection<br/>Appends warm-up footer"]
-        end
-
-        subgraph FullBox["Full Mode (~2-4min onward)"]
-            OPENCLAW["<b>OpenClaw Gateway :18789</b><br/>Headless mode · Full tool profile<br/>5 ClawHub skills · Sub-agents"]
+        subgraph AgentBox["Custom Agent"]
+            AGENT["<b>custom-agent.js</b><br/>Agentic loop (20 iters)<br/>14 tools · SSRF protection<br/>Sub-agent support"]
         end
 
         PROXY["<b>Bedrock Proxy :18790</b><br/>OpenAI compat → ConverseStream<br/>Cognito identity · Multimodal images"]
 
-        SHIM -->|"POST /v1/chat/completions<br/>(non-streaming)"| PROXY
-        OPENCLAW <-->|WebSocket| PROXY
+        AGENT -->|"POST /v1/chat/completions"| PROXY
     end
 
     PROXY -->|ConverseStream| BEDROCK["Amazon Bedrock<br/>Claude"]
 
     S3[("S3<br/>workspace · files · images")]
     CONTRACT <-->|"restore / save<br/>.openclaw/"| S3
-    SHIM -.->|"execFile<br/>skill scripts"| S3
+    AGENT -.->|"execFile<br/>skill scripts"| S3
 ```
 
-### Lightweight Agent Tools
+### Custom Agent Tools
 
 ```mermaid
 flowchart LR
@@ -224,7 +211,7 @@ flowchart LR
     CronTools -->|"/skills/eventbridge-cron/*.js"| EB["EventBridge<br/>Scheduler"]
 ```
 
-### Two-Phase Startup
+### Startup Timeline
 
 ```mermaid
 gantt
@@ -235,38 +222,29 @@ gantt
     section Container
     MicroVM created                     :done, t0, 0, 1s
 
-    section Warm-up Phase
-    Proxy starts (~5s)                  :active, t1, 1s, 5s
-    Lightweight agent handles messages  :active, t2, 5s, 150s
-
-    section Background
-    OpenClaw starting (~2-4 min)        :crit, t3, 5s, 150s
+    section Initialization
+    Proxy + custom agent start (~5s)    :active, t1, 1s, 5s
     Workspace restore from S3           :done, t4, 1s, 10s
 
-    section Full Mode
-    OpenClaw ready — handoff            :milestone, m1, 150s, 0
-    Full runtime handles messages       :t5, 150s, 200s
+    section Ready
+    Custom agent handles messages       :t5, 5s, 60s
 ```
 
-**Warm-up phase** (t=~5s to ~2-4min): Lightweight agent responds with 10 tools (web_fetch, web_search, 4 file, 4 cron). All responses include `"_Warm-up mode — after full startup..._"` footer.
+**Ready** (t=~5s): Custom agent responds with 14 tools (web_fetch, web_search, 4 file, 4 cron, and more). All tools available immediately after startup.
 
-**Full mode** (t=~2-4min onward): OpenClaw gateway handles messages via WebSocket bridge. No warm-up footer. ClawHub skills available (transcript, deep-research-pro, jina-reader, telegram-compose, task-decomposer).
+### Custom Agent Architecture
 
-### Lightweight Agent Architecture
-
-The lightweight agent (`bridge/lightweight-agent.js`) provides immediate responsiveness during the ~2-4 minute OpenClaw cold start. It is NOT a replacement for OpenClaw — it's a shim that handles messages until the full runtime is ready.
+The custom agent (`bridge/custom-agent.js`) provides the core AI agent functionality. It communicates with Bedrock via the proxy and executes tool calls using 14 built-in tools.
 
 | Property | Detail |
 |---|---|
-| **Routing** | Calls proxy at `127.0.0.1:18790/v1/chat/completions` (OpenAI format, non-streaming) |
+| **Routing** | Calls proxy at `127.0.0.1:18790/v1/chat/completions` (OpenAI format) |
 | **Agentic loop** | Up to 20 iterations of tool-call → tool-result → assistant-response |
-| **Tools (10)** | `read_user_file`, `write_user_file`, `list_user_files`, `delete_user_file`, `create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule`, `web_fetch`, `web_search` |
+| **Tools (14)** | `read_user_file`, `write_user_file`, `list_user_files`, `delete_user_file`, `create_schedule`, `list_schedules`, `update_schedule`, `delete_schedule`, `web_fetch`, `web_search`, and more |
 | **File/cron tools** | Execute skill scripts via `execFile` with isolated env vars |
 | **Web tools** | In-process HTTP(S) with SSRF prevention (blocked IPs, DNS rebinding mitigation, redirect validation) |
 | **SSRF protection** | Pre-connection hostname blocklist + post-DNS-resolution IP validation covering loopback, RFC-1918, RFC-6598, link-local (AWS IMDS), IPv6 ULA, IPv4-mapped IPv6 |
-| **Web limits** | 512KB raw HTML, 50KB text output, 15s timeout, 3 redirect max, 8 search results |
-| **Detection** | Appends deterministic `"_Warm-up mode — ..."` footer to every response; absence of footer = OpenClaw is handling messages |
-| **Handoff** | Contract server checks `openclawReady` flag; once true, all messages route via WebSocket bridge to OpenClaw |
+| **Sub-agents** | Native sub-agent calls running on the same AgentCore runtime |
 
 ## S3 Bucket Structure
 

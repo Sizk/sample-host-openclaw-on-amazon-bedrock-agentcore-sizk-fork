@@ -3,48 +3,18 @@
  *
  * Creates STS AssumeRole session credentials that restrict S3 access to
  * a single user's namespace prefix. Prevents cross-user data access even
- * if OpenClaw's bash/code execution tools are used to call the AWS CLI/SDK.
+ * if the agent's bash/code execution tools are used to call the AWS CLI/SDK.
  *
  * Usage:
- *   const { createScopedCredentials, writeCredentialFiles, buildOpenClawEnv } = require("./scoped-credentials");
+ *   const { createScopedCredentials, writeCredentialFiles } = require("./scoped-credentials");
  *   const creds = await createScopedCredentials(namespace);
  *   writeCredentialFiles(creds, "/tmp/scoped");
- *   const env = buildOpenClawEnv({ credDir: "/tmp/scoped", baseEnv: process.env });
- *   spawn("openclaw", args, { env });
  */
 
 const fs = require("fs");
 const path = require("path");
 
 const VALID_NAMESPACE = /^[a-zA-Z][a-zA-Z0-9_-]{1,64}$/;
-
-// ENV vars that MUST be excluded from OpenClaw to prevent credential leakage
-const CREDENTIAL_ENV_BLOCKLIST = [
-  "AWS_ACCESS_KEY_ID",
-  "AWS_SECRET_ACCESS_KEY",
-  "AWS_SESSION_TOKEN",
-  "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-  "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-  "AWS_WEB_IDENTITY_TOKEN_FILE",
-  "AWS_ROLE_ARN",
-];
-
-// ENV vars forwarded from baseEnv to OpenClaw process
-const FORWARDED_ENV_KEYS = [
-  "PATH",
-  "HOME",
-  "NODE_PATH",
-  "NODE_OPTIONS",
-  "AWS_REGION",
-  "S3_USER_FILES_BUCKET",
-  "SUBAGENT_BEDROCK_MODEL_ID",
-  // EventBridge cron skill
-  "EVENTBRIDGE_SCHEDULE_GROUP",
-  "IDENTITY_TABLE_NAME",
-  "CRON_LAMBDA_ARN",
-  "EVENTBRIDGE_ROLE_ARN",
-  "CRON_LEAD_TIME_MINUTES",
-];
 
 /**
  * Build an IAM session policy JSON string that scopes S3 access to a user's namespace.
@@ -277,48 +247,8 @@ function writeCredentialFiles(creds, dir) {
   fs.renameSync(configTmp, configPath);
 }
 
-/**
- * Build a clean environment for the OpenClaw child process.
- *
- * Includes scoped credential config and app env vars.
- * Explicitly EXCLUDES all AWS credential env vars to prevent
- * OpenClaw from accessing the container's full execution role.
- *
- * @param {object} opts
- * @param {string} opts.credDir - Directory containing scoped credential files
- * @param {object} [opts.baseEnv] - Base environment to extract forwarded vars from
- * @returns {object} Environment variables for spawn()
- */
-function buildOpenClawEnv({ credDir, baseEnv = {} }) {
-  const env = {};
-
-  // Forward allowed env vars from base environment
-  for (const key of FORWARDED_ENV_KEYS) {
-    if (baseEnv[key] !== undefined) {
-      env[key] = baseEnv[key];
-    }
-  }
-
-  // Scoped credentials via credential_process
-  env.AWS_CONFIG_FILE = path.join(credDir, "scoped-aws-config");
-  env.AWS_SDK_LOAD_CONFIG = "1";
-
-  // OpenClaw internal
-  env.OPENCLAW_SKIP_CRON = "1";
-
-  // Ensure no credential env vars leak through
-  for (const key of CREDENTIAL_ENV_BLOCKLIST) {
-    delete env[key];
-  }
-
-  return env;
-}
-
 module.exports = {
   buildSessionPolicy,
   createScopedCredentials,
   writeCredentialFiles,
-  buildOpenClawEnv,
-  CREDENTIAL_ENV_BLOCKLIST,
-  FORWARDED_ENV_KEYS,
 };

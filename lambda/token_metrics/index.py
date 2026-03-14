@@ -3,7 +3,7 @@
 Triggered by CloudWatch Logs subscription filter on /aws/bedrock/invocation-logs.
 For each invocation log entry:
   1. Extracts token counts (input/output), model ID
-  2. Extracts OpenClaw metadata (actor_id, session_id, channel) from request metadata
+  2. Extracts metadata (actor_id, session_id, channel) from request metadata
   3. Computes estimated cost using model pricing lookup
   4. Writes record to DynamoDB with composite keys for multi-access patterns
   5. Publishes CloudWatch custom metrics with dimensions
@@ -65,10 +65,11 @@ def estimate_cost(model_id: str, input_tokens: int, output_tokens: int) -> float
 
 
 def extract_openclaw_metadata(log_entry: dict) -> dict:
-    """Extract OpenClaw metadata (actor_id, session_id, channel) from the log entry.
+    """Extract metadata (actor_id, session_id, channel) from the log entry.
 
     Bedrock invocation logs may contain request metadata or we can correlate
     via X-Ray trace IDs. Supports both direct Bedrock and AgentCore log formats.
+    The metadata keys use the 'openclaw.' prefix (project namespace in Bedrock request metadata).
     """
     metadata = {
         "actor_id": "default-user",
@@ -278,7 +279,7 @@ def process_log_entry(log_entry: dict):
     # Extract model ID
     model_id = log_entry.get("modelId", log_entry.get("model_id", "unknown"))
 
-    # Extract OpenClaw metadata
+    # Extract user metadata from Bedrock request metadata
     metadata = extract_openclaw_metadata(log_entry)
 
     # Compute timestamp and date

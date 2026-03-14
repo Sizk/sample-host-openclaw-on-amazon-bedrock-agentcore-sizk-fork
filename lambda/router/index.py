@@ -64,6 +64,14 @@ _token_cache = {}
 
 BIND_CODE_TTL_SECONDS = 600  # 10 minutes
 
+# --- Telegram update_id dedup (prevents processing duplicate webhooks) ---
+# LRU-style set of recently processed update_ids. Telegram may send the same
+# webhook twice under network issues even after we return 200. Without dedup,
+# both async-dispatch Lambdas would process the same message.
+_processed_update_ids = set()
+_processed_update_ids_list = []  # maintains insertion order for eviction
+MAX_PROCESSED_UPDATE_IDS = 1000
+
 
 def _get_secret(secret_id):
     """Fetch a secret value, cached for the lifetime of the Lambda container."""
@@ -822,23 +830,41 @@ CONTENT_TYPE_TO_EXT = {
 ALLOWED_DOCUMENT_TYPES = {
     "application/pdf",
     "text/csv",
+    "application/csv",
+    "text/comma-separated-values",
     "text/plain",
     "application/json",
     "text/markdown",
     "text/html",
+    "application/xml",
+    "text/xml",
+    "application/vnd.ms-excel",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-excel.sheet.macroEnabled.12",  # .xlsm
+    "application/vnd.ms-excel.sheet.binary.macroEnabled.12",  # .xlsb
+    "application/octet-stream",  # Generic binary — Telegram uses this for unrecognized file types
 }
 MAX_DOCUMENT_BYTES = 4_500_000  # 4.5 MB — Bedrock Converse document limit
 DOCUMENT_TYPE_TO_EXT = {
     "application/pdf": "pdf",
     "text/csv": "csv",
+    "application/csv": "csv",
+    "text/comma-separated-values": "csv",
     "text/plain": "txt",
     "application/json": "json",
     "text/markdown": "md",
     "text/html": "html",
+    "application/xml": "xml",
+    "text/xml": "xml",
+    "application/vnd.ms-excel": "xls",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "application/vnd.ms-excel.sheet.macroEnabled.12": "xlsm",
+    "application/vnd.ms-excel.sheet.binary.macroEnabled.12": "xlsb",
+    "application/octet-stream": "bin",
 }
 ALLOWED_FILE_TYPES = ALLOWED_IMAGE_TYPES | ALLOWED_DOCUMENT_TYPES
 
@@ -911,13 +937,13 @@ def _upload_document_to_s3(doc_bytes, namespace, content_type, original_filename
         return None
 
 
-def _download_telegram_document(message, token):
+def _download_telegram_document(message, token, inferred_mime=""):
     """Download a non-image document from a Telegram message.
 
     Returns (bytes, content_type, filename) or (None, None, None).
     """
     doc = message.get("document", {})
-    mime = doc.get("mime_type", "")
+    mime = doc.get("mime_type", "") or inferred_mime
     if mime not in ALLOWED_DOCUMENT_TYPES:
         return None, None, None
 
@@ -1320,6 +1346,22 @@ def _is_link_command(text):
 def handle_telegram(body):
     """Process a Telegram webhook update."""
     update = json.loads(body) if isinstance(body, str) else body
+
+    # --- Dedup: skip already-processed updates ---
+    # Telegram may send duplicate webhooks under network issues. Each update
+    # has a unique update_id. Skip if we've already processed this one.
+    update_id = update.get("update_id")
+    if update_id is not None:
+        if update_id in _processed_update_ids:
+            logger.info("Telegram: skipping duplicate update_id=%s", update_id)
+            return
+        _processed_update_ids.add(update_id)
+        _processed_update_ids_list.append(update_id)
+        # Evict oldest entries to prevent unbounded growth
+        while len(_processed_update_ids_list) > MAX_PROCESSED_UPDATE_IDS:
+            old_id = _processed_update_ids_list.pop(0)
+            _processed_update_ids.discard(old_id)
+
     message = update.get("message", {})
     text = message.get("text", "") or message.get("caption", "")
     chat_id = message.get("chat", {}).get("id")
@@ -1328,19 +1370,55 @@ def handle_telegram(body):
     display_name = user.get("first_name", "") or user.get("username", "")
 
     # Detect image: photo array or document with image mime type
+    doc_obj = message.get("document", {})
+    doc_mime = doc_obj.get("mime_type", "")
+    doc_filename = doc_obj.get("file_name", "")
+    # Infer MIME from file extension when Telegram sends no mime_type
+    if not doc_mime and doc_filename:
+        EXT_TO_MIME = {
+            ".pdf": "application/pdf", ".csv": "text/csv", ".txt": "text/plain",
+            ".json": "application/json", ".md": "text/markdown", ".html": "text/html",
+            ".xml": "application/xml", ".xls": "application/vnd.ms-excel",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".xlsm": "application/vnd.ms-excel.sheet.macroEnabled.12",
+            ".xlsb": "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        }
+        ext = "." + doc_filename.rsplit(".", 1)[-1].lower() if "." in doc_filename else ""
+        doc_mime = EXT_TO_MIME.get(ext, "application/octet-stream")
+        logger.info("Telegram: inferred mime_type=%s from filename=%s", doc_mime, doc_filename)
+
     has_image = bool(
         message.get("photo")
-        or (message.get("document", {}).get("mime_type", "") in ALLOWED_IMAGE_TYPES)
+        or (doc_mime in ALLOWED_IMAGE_TYPES)
     )
     # Detect document: document with allowed non-image mime type
     has_document = bool(
         not has_image
-        and message.get("document", {}).get("mime_type", "") in ALLOWED_DOCUMENT_TYPES
+        and doc_obj
+        and doc_mime in ALLOWED_DOCUMENT_TYPES
     )
     has_file = has_image or has_document
 
+    # Log raw document info for debugging file type detection
+    raw_doc = message.get("document")
+    if raw_doc:
+        logger.info(
+            "Telegram: document detected — mime_type=%s file_name=%s file_size=%s has_image=%s has_document=%s",
+            raw_doc.get("mime_type", "NONE"), raw_doc.get("file_name", "NONE"),
+            raw_doc.get("file_size", "NONE"), has_image, has_document,
+        )
+
     if not chat_id or not user_id_tg or (not text and not has_file):
-        logger.info("Telegram: ignoring non-text/non-file or missing-user message")
+        doc_mime = message.get("document", {}).get("mime_type", "")
+        if doc_mime:
+            logger.warning(
+                "Telegram: rejected document with unsupported mime_type=%s filename=%s",
+                doc_mime, message.get("document", {}).get("file_name", ""),
+            )
+        else:
+            logger.info("Telegram: ignoring non-text/non-file or missing-user message")
         return
 
     token = _get_telegram_token()
@@ -1431,7 +1509,7 @@ def handle_telegram(body):
             return
     elif has_document:
         namespace = actor_id.replace(":", "_")
-        doc_bytes, content_type, filename = _download_telegram_document(message, token)
+        doc_bytes, content_type, filename = _download_telegram_document(message, token, inferred_mime=doc_mime)
         if doc_bytes:
             s3_key = _upload_document_to_s3(doc_bytes, namespace, content_type, filename)
             if s3_key:

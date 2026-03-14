@@ -1,7 +1,7 @@
 {
   "name": "eventbridge-cron",
   "version": "1.0.0",
-  "description": "EventBridge Scheduler cron job management for OpenClaw",
+  "description": "EventBridge Scheduler cron job management",
   "private": true,
   "dependencies": {
     "@aws-sdk/client-scheduler": "^3.0.0",

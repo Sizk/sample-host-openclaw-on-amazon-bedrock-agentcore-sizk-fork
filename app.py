@@ -32,7 +32,7 @@ vpc_stack = VpcStack(app, "OpenClawVpc", env=env)
 
 security_stack = SecurityStack(app, "OpenClawSecurity", env=env)
 
-# --- AgentCore (hosts OpenClaw container, per-user sessions) ---
+# --- AgentCore (hosts the bridge container, per-user sessions) ---
 agentcore_stack = AgentCoreStack(
     app,
     "OpenClawAgentCore",

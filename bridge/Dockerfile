@@ -19,24 +19,13 @@ RUN pip3 install --no-cache-dir --break-system-packages \
     matplotlib pillow qrcode icalendar \
     scrapling curl_cffi openpyxl
 
-# Install OpenClaw and ClawHub CLI globally
-RUN npm install -g openclaw@latest clawhub@latest
-
-# Install ClawHub community skills.
-# NODE_TLS_REJECT_UNAUTHORIZED=0 bypasses clawhub.io expired SSL cert at build time.
-# --no-input --force: non-interactive, skip VirusTotal warnings.
-RUN NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install jina-reader --no-input --force && \
-    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install deep-research-pro --no-input --force && \
-    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install telegram-compose --no-input --force && \
-    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install transcript --no-input --force && \
-    NODE_TLS_REJECT_UNAUTHORIZED=0 clawhub install task-decomposer --no-input --force
-
 # Create app directory
 RUN mkdir -p /app
 
 WORKDIR /app
 
 # Install AWS SDK and WebSocket library (production only)
+# ws is a transitive dependency of puppeteer-core for CDP connections
 RUN cd /app && npm init -y > /dev/null 2>&1 && \
     npm install --omit=dev \
                 @aws-sdk/client-bedrock-runtime \
@@ -47,7 +36,8 @@ RUN cd /app && npm init -y > /dev/null 2>&1 && \
                 @aws-sdk/client-dynamodb \
                 @aws-sdk/client-sts \
                 @aws-sdk/lib-dynamodb \
-                ws
+                ws \
+                puppeteer-core
 
 # Pre-warm V8 compile cache for heavy AWS SDK modules.
 # This populates the bytecode cache at build time so runtime module loading is faster.
@@ -62,8 +52,15 @@ RUN mkdir -p /app/.compile-cache && \
       require('@aws-sdk/client-sts'); \
       require('@aws-sdk/lib-dynamodb'); \
       require('ws'); \
+      require('puppeteer-core'); \
       console.log('[build] V8 compile cache pre-warmed'); \
     "
+
+# Install Lightpanda browser (ARM64 binary — headless browser for web scraping)
+# 10x faster than Chrome, 10x less memory. Used via CDP with puppeteer-core.
+RUN curl -L -o /usr/local/bin/lightpanda \
+    https://github.com/lightpanda-io/browser/releases/download/nightly/lightpanda-aarch64-linux && \
+    chmod a+x /usr/local/bin/lightpanda
 
 # ============================================================
 # Stage 2: Runtime — minimal image with only needed artifacts
@@ -80,15 +77,8 @@ COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
 COPY --from=builder /usr/local/lib/python3.*/dist-packages /usr/local/lib/python3.11/dist-packages
 COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-packages
 
-# Copy OpenClaw and ClawHub from builder (global npm modules + binaries)
-COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
-# Re-create symlinks instead of COPY (which resolves symlinks and breaks
-# relative imports like ./dist/entry.js in the openclaw ESM binary)
-RUN ln -s /usr/local/lib/node_modules/openclaw/openclaw.mjs /usr/local/bin/openclaw && \
-    ln -s /usr/local/lib/node_modules/clawhub/bin/clawdhub.js /usr/local/bin/clawhub
-
-# Copy ClawHub installed skills (clawhub installs to /skills/ in builder)
-COPY --from=builder /skills/ /skills/
+# Copy Lightpanda browser binary from builder
+COPY --from=builder /usr/local/bin/lightpanda /usr/local/bin/lightpanda
 
 # Copy app directory (node_modules, compile cache)
 COPY --from=builder /app/node_modules /app/node_modules
@@ -100,21 +90,17 @@ ENV NODE_PATH=/app/node_modules
 
 WORKDIR /app
 
-# Pre-create OpenClaw workspace directory (avoids mkdir at runtime)
-RUN mkdir -p /root/.openclaw
-
 # Copy application files
 COPY agentcore-contract.js /app/agentcore-contract.js
-COPY openclaw-config.js /app/openclaw-config.js
+COPY custom-agent.js /app/custom-agent.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
-COPY lightweight-agent.js /app/lightweight-agent.js
+COPY lightpanda-fetch.js /app/lightpanda-fetch.js
 COPY channel-sender.js /app/channel-sender.js
 COPY workspace-sync.js /app/workspace-sync.js
 COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
 
 # Copy custom per-user file storage skill
-# /skills/ — scanned via extraDirs config (skills also copied to home dir during user setup below)
 COPY skills/s3-user-files /skills/s3-user-files
 RUN chmod +x /skills/s3-user-files/*.js
 

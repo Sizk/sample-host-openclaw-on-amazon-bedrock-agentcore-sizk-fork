@@ -74,11 +74,11 @@ class TailResult:
 
     @property
     def is_warmup(self) -> bool:
-        """True if response came from the lightweight agent warm-up shim.
+        """True if response came from the warm-up shim.
 
         The shim appends a deterministic footer containing 'warm-up mode'.
-        When OpenClaw is fully running, responses route through the WebSocket
-        bridge and never contain this footer.
+        When the custom agent is fully running, responses are handled by the
+        agent via the proxy and never contain this footer.
         """
         return "warm-up mode" in self.response_text.lower()
 

@@ -139,17 +139,26 @@ function extractTextFromContentBlocks(text) {
     const stripped = result.trim();
     if (!stripped.startsWith("[") || !stripped.endsWith("]")) break;
     // Sanitize control characters that are invalid in JSON strings but may
-    // appear in OpenClaw bridge responses (literal newlines, tabs, etc.).
+    // appear in bridge responses (literal newlines, tabs, etc.).
     // Matches Python's json.JSONDecoder(strict=False) behavior.
-    const sanitized = stripped.replace(/[\x00-\x1f]/g, (ch) => {
-      if (ch === "\n") return "\\n";
-      if (ch === "\r") return "\\r";
-      if (ch === "\t") return "\\t";
-      return "";
-    });
+    // Only sanitize within JSON string values to avoid corrupting content.
+    const sanitized = stripped.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, "");
+    // Replace literal newlines/tabs with JSON escapes for parse attempt
+    const forParse = sanitized
+      .replace(/\t/g, "\\t")
+      .replace(/\r\n/g, "\\n")
+      .replace(/\r/g, "\\n")
+      .replace(/\n/g, "\\n");
     let parsed = false;
     try {
-      const blocks = JSON.parse(sanitized);
+      // Try strict parse first with escaped version
+      let blocks;
+      try {
+        blocks = JSON.parse(forParse);
+      } catch {
+        // Fall back to parsing the sanitized version (allows literal newlines in strings)
+        blocks = JSON.parse(sanitized);
+      }
       if (Array.isArray(blocks) && blocks.length > 0) {
         const parts = blocks
           .filter((b) => typeof b === "object" && b && b.type === "text")
@@ -162,14 +171,19 @@ function extractTextFromContentBlocks(text) {
         }
       }
     } catch (e) {
-      console.warn(
-        `[channel-sender] Content block JSON.parse failed: ${e.message} | start: ${stripped.slice(0, 100)}`,
-      );
+      // Only log at debug level — parse failures are expected during streaming
+      if (stripped.length > 50) {
+        console.warn(
+          `[channel-sender] Content block JSON.parse failed: ${e.message} | len=${stripped.length} start: ${stripped.slice(0, 100)}`,
+        );
+      }
     }
     if (parsed) continue;
 
     // Regex fallback: strip [{"type":"text","text":"..."}] wrapper (complete or partial)
     // During streaming, deltas may be incomplete JSON — strip the prefix anyway.
+    // Guard: only apply if the prefix is a content block pattern, not user content
+    // that happens to start with [{"type
     const prefixMatch = stripped.match(
       /^\[\s*\{\s*"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"/,
     );
@@ -178,8 +192,8 @@ function extractTextFromContentBlocks(text) {
       // Strip closing "}] if present (complete content block)
       if (inner.endsWith('"}]')) inner = inner.slice(0, -3);
       // Unescape JSON string escapes
-      // Unescape order matters: \\\\ → \\ must run LAST to avoid
-      // interfering with other escape sequences like \\" → "
+      // Unescape order matters: \\\\ -> \\ must run LAST to avoid
+      // interfering with other escape sequences like \\" -> "
       const unescaped = inner
         .replace(/\\n/g, "\n")
         .replace(/\\r/g, "\r")

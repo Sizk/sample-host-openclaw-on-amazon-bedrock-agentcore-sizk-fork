@@ -119,15 +119,15 @@ class TestColdStart:
 
 
 class TestWarmupShim:
-    """Verify the lightweight agent warm-up shim is responding during cold start."""
+    """Verify the agent responds during cold start."""
 
-    # Deterministic footer appended by the shim to every response
+    # Deterministic footer appended during warm-up
     SHIM_FOOTER = "warm-up mode"
 
     def test_cold_start_shim_response(self, e2e_config):
         """After session reset + stop, the first response should come from
         the warm-up shim and include the deterministic footer about
-        additional community skills coming online after full startup."""
+        additional tools coming online after full startup."""
         from .session import _stop_agentcore_session
 
         user_id = get_user_id(e2e_config)
@@ -154,26 +154,26 @@ class TestWarmupShim:
 
 
 class TestFullStartup:
-    """Verify OpenClaw fully starts up and ClawHub skills become available.
+    """Verify the custom agent fully starts up and all tools become available.
 
     Unlike TestWarmupShim (which only checks the cold-start shim responds),
-    this test waits for the full OpenClaw runtime to come online. It measures
+    this test waits for the full agent runtime to come online. It measures
     the timing of each phase:
-      1. Webhook → warm-up response (lightweight agent shim, ~5-15s)
-      2. Warm-up → full OpenClaw ready (no more warm-up footer, ~2-4min)
+      1. Webhook → warm-up response (~5-15s)
+      2. Warm-up → agent ready (no more warm-up footer, ~2-4min)
 
     The test confirms full startup by sending a message that exercises a
-    ClawHub skill (only available after OpenClaw gateway is ready). A response
-    without the warm-up footer proves the full runtime is handling messages.
+    tool (only available after the agent is ready). A response without the
+    warm-up footer proves the full runtime is handling messages.
     """
 
-    # Maximum time to wait for OpenClaw to finish starting (seconds).
+    # Maximum time to wait for the agent to finish starting (seconds).
     # Typical cold start is ~2-4 min; 10 min covers slow regions/cold pulls.
     MAX_STARTUP_WAIT_S = 600
     POLL_INTERVAL_S = 30  # Time between status-check messages
 
     def test_full_startup_and_skill(self, e2e_config):
-        """Reset session, wait for full OpenClaw startup, verify a
+        """Reset session, wait for full agent startup, verify a
         post-warmup response (no warm-up footer)."""
         from .session import _stop_agentcore_session
 
@@ -200,11 +200,11 @@ class TestFullStartup:
         # First response during cold start should be from the shim
         assert tail.is_warmup, (
             f"Expected warm-up shim response on cold start, but got full "
-            f"OpenClaw response in {warmup_response_s:.1f}s. "
+            f"agent response in {warmup_response_s:.1f}s. "
             f"Response: {tail.response_text[:200]}"
         )
 
-        # --- Phase 2: Poll until OpenClaw is fully started ---
+        # --- Phase 2: Poll until the agent is fully started ---
         fully_up = False
         full_startup_s = 0.0
         last_response = ""
@@ -232,14 +232,14 @@ class TestFullStartup:
                 break
 
         assert fully_up, (
-            f"OpenClaw did not fully start within {self.MAX_STARTUP_WAIT_S}s. "
+            f"Agent did not fully start within {self.MAX_STARTUP_WAIT_S}s. "
             f"Still seeing warm-up footer.\n"
             f"Last response: {last_response[:300]}"
         )
 
         # --- Report timing ---
         print(f"\n  Phase 1 — warm-up response: {warmup_response_s:.1f}s")
-        print(f"  Phase 2 — full OpenClaw ready: {full_startup_s:.1f}s")
+        print(f"  Phase 2 — agent ready: {full_startup_s:.1f}s")
         print(f"  Response (no warm-up footer): {last_response[:200]}")
 
         # Sanity: full startup should take at least 30s (if faster, the shim
@@ -251,16 +251,16 @@ class TestFullStartup:
 
 
 # ---------------------------------------------------------------------------
-# Shared helper: wait for full OpenClaw startup
+# Shared helper: wait for agent ready
 # ---------------------------------------------------------------------------
 
-_OPENCLAW_STARTUP_TIMEOUT_S = 600  # Max wait for full cold start (slow regions)
+_AGENT_STARTUP_TIMEOUT_S = 600  # Max wait for full cold start (slow regions)
 _SUBAGENT_TIMEOUT_S = 600  # Sub-agent skills may take several minutes
 
 
-def _wait_for_full_openclaw(e2e_config, max_wait_s=_OPENCLAW_STARTUP_TIMEOUT_S,
-                            poll_interval_s=30):
-    """Wait for OpenClaw to be fully started (not in warm-up mode).
+def _wait_for_agent_ready(e2e_config, max_wait_s=_AGENT_STARTUP_TIMEOUT_S,
+                          poll_interval_s=30):
+    """Wait for the custom agent to be fully started (not in warm-up mode).
 
     Sends periodic status-check messages until the response no longer
     contains the warm-up footer. Sleeps before the first probe to avoid
@@ -286,18 +286,18 @@ def _wait_for_full_openclaw(e2e_config, max_wait_s=_OPENCLAW_STARTUP_TIMEOUT_S,
 
 
 class TestSubagent:
-    """Verify sub-agent skills work after full OpenClaw startup.
+    """Verify sub-agent skills work after full agent startup.
 
     Tests deep-research-pro and task-decomposer skills, which spawn
-    sub-agents for parallel work. Requires OpenClaw to be fully started
-    (not in warm-up mode).
+    sub-agents for parallel work. Requires the custom agent to be fully
+    started (not in warm-up mode).
 
     After each skill invocation, queries the contract status endpoint to
     verify that subagentRequestCount increased — definitive proof that
-    OpenClaw subagents actually fired (not just that the skill responded).
+    subagents actually fired (not just that the skill responded).
 
     These tests are slower than other E2E tests because:
-    1. They may need to wait for full OpenClaw startup (~2-4 min)
+    1. They may need to wait for full agent startup (~2-4 min)
     2. Sub-agent skills take longer to execute than simple responses
 
     Run with: pytest tests/e2e/bot_test.py -v -k subagent
@@ -309,11 +309,11 @@ class TestSubagent:
     MIN_DEEP_RESEARCH_LEN = 200
 
     @pytest.fixture(scope="class", autouse=True)
-    def ensure_full_openclaw(self, e2e_config):
-        """Wait for full OpenClaw startup once before all subagent tests."""
-        ready, elapsed = _wait_for_full_openclaw(e2e_config)
-        assert ready, f"OpenClaw not fully started after {elapsed:.0f}s"
-        print(f"\n  OpenClaw ready in {elapsed:.1f}s")
+    def ensure_agent_ready(self, e2e_config):
+        """Wait for full agent startup once before all subagent tests."""
+        ready, elapsed = _wait_for_agent_ready(e2e_config)
+        assert ready, f"Agent not fully started after {elapsed:.0f}s"
+        print(f"\n  Agent ready in {elapsed:.1f}s")
 
     @staticmethod
     def _get_subagent_count(e2e_config):
@@ -331,7 +331,7 @@ class TestSubagent:
 
         The task-decomposer skill spawns sub-agents to break complex
         requests into manageable subtasks. Verifies the response is
-        substantial, came from full OpenClaw (not warm-up shim), and
+        substantial, came from the full agent (not warm-up shim), and
         that subagentRequestCount increased.
         """
         baseline_count = self._get_subagent_count(e2e_config)
@@ -351,7 +351,7 @@ class TestSubagent:
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
         assert not tail.is_warmup, (
-            "Response came from warm-up shim, not full OpenClaw. "
+            "Response came from warm-up shim, not full agent. "
             "Task-decomposer skill not available during warm-up."
         )
         assert tail.response_len >= self.MIN_TASK_DECOMPOSE_LEN, (
@@ -388,7 +388,7 @@ class TestSubagent:
 
         The deep-research-pro skill spawns sub-agents for multi-step
         research on complex topics. Verifies the response is detailed,
-        came from full OpenClaw (not warm-up shim), and that
+        came from the full agent (not warm-up shim), and that
         subagentRequestCount increased.
         """
         baseline_count = self._get_subagent_count(e2e_config)
@@ -408,7 +408,7 @@ class TestSubagent:
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
         assert not tail.is_warmup, (
-            "Response came from warm-up shim, not full OpenClaw. "
+            "Response came from warm-up shim, not full agent. "
             "Deep-research-pro skill not available during warm-up."
         )
         assert tail.response_len >= self.MIN_DEEP_RESEARCH_LEN, (
@@ -444,10 +444,10 @@ class TestSubagent:
 class TestScopedCredentials:
     """Verify per-user S3 credential isolation via the s3-user-files skill.
 
-    After the scoped credentials fix (GitHub issue #20), OpenClaw runs with
-    STS session-scoped credentials that restrict S3 access to the user's
-    namespace prefix. This test verifies the s3-user-files skill still works
-    end-to-end through those scoped credentials.
+    After the scoped credentials fix (GitHub issue #20), the custom agent
+    runs with STS session-scoped credentials that restrict S3 access to
+    the user's namespace prefix. This test verifies the s3-user-files skill
+    still works end-to-end through those scoped credentials.
 
     Flow:
       1. Write a test file via the bot (uses s3-user-files write skill)
@@ -462,11 +462,11 @@ class TestScopedCredentials:
     TEST_FILENAME = "e2e-creds-test.txt"
 
     @pytest.fixture(scope="class", autouse=True)
-    def ensure_full_openclaw(self, e2e_config):
-        """Wait for full OpenClaw startup — s3-user-files skill requires it."""
-        ready, elapsed = _wait_for_full_openclaw(e2e_config)
-        assert ready, f"OpenClaw not fully started after {elapsed:.0f}s"
-        print(f"\n  OpenClaw ready in {elapsed:.1f}s")
+    def ensure_agent_ready(self, e2e_config):
+        """Wait for full agent startup — s3-user-files skill requires it."""
+        ready, elapsed = _wait_for_agent_ready(e2e_config)
+        assert ready, f"Agent not fully started after {elapsed:.0f}s"
+        print(f"\n  Agent ready in {elapsed:.1f}s")
 
     def test_write_file(self, e2e_config):
         """Write a test file via the bot's s3-user-files skill."""
@@ -482,7 +482,7 @@ class TestScopedCredentials:
             f"Write file incomplete (timed_out={tail.timed_out}, "
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
-        assert not tail.is_warmup, "Response from warm-up shim, not full OpenClaw"
+        assert not tail.is_warmup, "Response from warm-up shim, not full agent"
         print(f"  Write response ({tail.response_len} chars): {tail.response_text[:200]}")
 
     def test_read_file(self, e2e_config):
@@ -499,7 +499,7 @@ class TestScopedCredentials:
             f"Read file incomplete (timed_out={tail.timed_out}, "
             f"elapsed={tail.elapsed_s:.1f}s)"
         )
-        assert not tail.is_warmup, "Response from warm-up shim, not full OpenClaw"
+        assert not tail.is_warmup, "Response from warm-up shim, not full agent"
 
         # The response should contain the test content we wrote
         assert self.TEST_CONTENT in tail.response_text, (
@@ -608,14 +608,14 @@ def _cli_subagent(cfg, tail):
     Always polls CloudWatch during startup wait (regardless of --tail-logs),
     then uses the tail flag for the actual skill invocation logs.
     """
-    print("Sub-agent skill tests (requires full OpenClaw startup)")
-    print("Waiting for OpenClaw to be fully started...")
+    print("Sub-agent skill tests (requires full agent startup)")
+    print("Waiting for agent to be fully started...")
 
-    ready, elapsed = _wait_for_full_openclaw(cfg)
+    ready, elapsed = _wait_for_agent_ready(cfg)
     if not ready:
-        print(f"  FAIL — OpenClaw not fully started after {elapsed:.0f}s")
+        print(f"  FAIL — Agent not fully started after {elapsed:.0f}s")
         return False
-    print(f"  OpenClaw ready in {elapsed:.1f}s\n")
+    print(f"  Agent ready in {elapsed:.1f}s\n")
 
     prompts = [
         ("task-decomposer", "Break down the task of building a REST API into subtasks"),
@@ -637,16 +637,16 @@ def _cli_scoped_creds(cfg, tail):
     """Test S3 file operations via scoped credentials (write, read, delete).
 
     Verifies that the s3-user-files skill works through STS session-scoped
-    credentials. Requires full OpenClaw startup.
+    credentials. Requires full agent startup.
     """
     print("Scoped credentials test (S3 file operations, requires full startup)")
-    print("Waiting for OpenClaw to be fully started...")
+    print("Waiting for agent to be fully started...")
 
-    ready, elapsed = _wait_for_full_openclaw(cfg)
+    ready, elapsed = _wait_for_agent_ready(cfg)
     if not ready:
-        print(f"  FAIL — OpenClaw not fully started after {elapsed:.0f}s")
+        print(f"  FAIL — Agent not fully started after {elapsed:.0f}s")
         return False
-    print(f"  OpenClaw ready in {elapsed:.1f}s\n")
+    print(f"  Agent ready in {elapsed:.1f}s\n")
 
     test_content = "E2E_SCOPED_CREDS_OK"
     test_file = "e2e-creds-test.txt"
