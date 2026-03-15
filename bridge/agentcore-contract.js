@@ -790,13 +790,14 @@ const messageQueue = []; // { messageText, actorId, channel, chatId }
 function isStatusQuery(text) {
   if (!text || typeof text !== "string") return false;
   const lower = text.toLowerCase().trim();
+  // Strip leading punctuation/emoji so "?? como vas?" or "!! how's it going" still match
+  const stripped = lower.replace(/^[^\p{L}\p{N}]+/u, "").trim();
   const patterns = [
     /^(como|cómo)\s+(va|vas|vamos)/,          // Spanish: "como va", "como vas", "como vamos"
     /^(que|qué)\s+tal\s+(va|vas)/,             // Spanish: "que tal va", "que tal vas"
     /^(how('s| is|s)?\s+(it|that|the task)?\s*(going|progressing|doing))/,  // English
     /^status\b/,                                // "status", "status?"
     /^progress\b/,                              // "progress", "progress?"
-    /^\?+$/,                                    // just question marks: "?", "??", "???"
     /^(sigues|estas|estás)\s+(ahí|ahi|trabajando)/,  // Spanish: "sigues ahi"
     /^(still|are you)\s+(there|working|running)/,     // English: "still there"
     /^(en que|en qué)\s+(andas|vas|estas|estás)/,     // Spanish: "en que andas"
@@ -804,11 +805,14 @@ function isStatusQuery(text) {
     /^(como|cómo)\s+va\s+(el|la|eso)/,         // Spanish: "como va el tema", "como va eso"
     /^(que|qué)\s+(haces|estas haciendo|estás haciendo)/, // Spanish: "que haces", "que estas haciendo"
   ];
-  return patterns.some((p) => p.test(lower));
+  // Match on both original (for "?" / "??") and stripped (for "?? como vas?")
+  return /^\?+$/.test(lower) || patterns.some((p) => p.test(stripped));
 }
 
 /**
  * Format sub-agent status as a user-friendly message.
+ * NEVER expose internal details: tool names, commands, URLs, step counts.
+ * Present a clean, human-readable progress summary.
  */
 function formatSubagentStatus(status) {
   if (!status) return null;
@@ -817,18 +821,25 @@ function formatSubagentStatus(status) {
   const secs = elapsed % 60;
   const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 
-  let msg = `Working on it (${timeStr} elapsed).\n\n`;
-  for (const a of status.agents) {
-    const progress = `${a.iteration}/${a.maxIterations}`;
-    const statusEmoji = a.status === "running" ? "\u2699\ufe0f" : a.status === "completed" ? "\u2705" : "\u23f3";
-    msg += `${statusEmoji} Agent ${a.id} [${a.toolSet}]: step ${progress}`;
-    if (a.lastTool) {
-      msg += ` — ${a.lastTool}`;
-      if (a.lastToolArg) msg += `: ${a.lastToolArg}`;
-    }
-    msg += `\n`;
+  const total = status.agents.length;
+  const completed = status.agents.filter((a) => a.status === "completed").length;
+  const running = status.agents.filter((a) => a.status === "running" || a.status === "starting").length;
+
+  // User-friendly task descriptions — strip internal jargon and URLs from descriptions
+  const taskSummaries = status.agents.map((a) => {
+    const emoji = a.status === "completed" ? "\u2705" : a.status === "running" ? "\u23f3" : "\u2699\ufe0f";
+    // Use the task description (set by main agent), clean URLs to avoid link previews
+    const desc = (a.description || "Processing").replace(/https?:\/\/\S+/g, "").trim() || "Processing";
+    return `${emoji} ${desc}`;
+  });
+
+  let msg = `Working on it (${timeStr} elapsed).`;
+  if (total > 1) {
+    msg += ` ${completed}/${total} tasks done.`;
   }
-  return msg.trim();
+  msg += `\n\n${taskSummaries.join("\n")}`;
+
+  return msg;
 }
 
 /**
