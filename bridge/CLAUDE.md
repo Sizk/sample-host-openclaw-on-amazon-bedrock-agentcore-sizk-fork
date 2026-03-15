@@ -33,45 +33,74 @@ All tools are available immediately on startup (~5 second cold start):
 
 ## Web Scraping — Use the Right Tool!
 
-A **Lightpanda headless browser** is ALWAYS running at `ws://127.0.0.1:9222` (CDP protocol).
-Lightpanda is 10x faster and uses 10x less memory than Chrome. Use it for ALL JS-heavy scraping.
+Scrapling (Python) is the PRIMARY scraping tool. It handles TLS fingerprint impersonation,
+anti-bot bypass, and full browser automation. Lightpanda + Puppeteer is available as a fallback.
 
-### 1. Puppeteer + Lightpanda (PREFERRED for JS-rendered sites)
-**Use this for**: Fotocasa, pisos.com, yaencontre, globaliza, nestoria, and ANY site that needs JavaScript rendering, cookie consent handling, or dynamic content loading.
+### 1. Scrapling Fetcher (PREFERRED — fast, 100-1500ms)
+Use for MOST sites. HTTP request with Chrome TLS fingerprint impersonation.
+Works on: Fotocasa, pisos.com, Milanuncios, Investing.com, tech news, Amazon ES, Wallapop, CoinGecko.
+```python
+from scrapling.fetchers import Fetcher
+page = Fetcher.get('https://example.com', impersonate='chrome', stealthy_headers=True, follow_redirects=True)
+items = page.css('article').getall()           # CSS selector
+titles = page.css('h2 a::text').getall()       # extract text
+links = page.css('h2 a::attr(href)').getall()  # extract attributes
+# Structured extraction
+data = [{'title': el.css('h2::text').get(), 'price': el.css('.price::text').get()}
+        for el in page.css('article')]
+import json; print(json.dumps([d for d in data if d.get('title')], ensure_ascii=False))
+```
+
+### 2. StealthyFetcher (anti-bot bypass, 2-10s)
+Full stealth browser with Cloudflare bypass. Use when Fetcher gets 403/blocked.
+```python
+from scrapling.fetchers import StealthyFetcher
+page = StealthyFetcher.fetch('https://hard-site.com', headless=True, network_idle=True,
+                              google_search=True, solve_cloudflare=True)
+data = page.css('article').getall()
+```
+
+### 3. DynamicFetcher / DynamicSession (full browser, 3-30s)
+Full Playwright Chromium. Use for JS-heavy SPAs or when you need cookie consent handling or multi-page sessions.
+```python
+from scrapling.fetchers import DynamicFetcher, DynamicSession
+# One-off
+page = DynamicFetcher.fetch('https://spa-site.com', headless=True, network_idle=True, disable_resources=False)
+# Persistent session (cookies carry over)
+with DynamicSession(headless=True, disable_resources=False, network_idle=True) as session:
+    page1 = session.fetch('https://example.com/page1')
+    page2 = session.fetch('https://example.com/page2')
+```
+
+### 4. Puppeteer + Lightpanda (fallback for JS rendering)
+A **Lightpanda headless browser** is ALWAYS running at `ws://127.0.0.1:9222` (CDP protocol).
+Only use if Scrapling isn't working for a specific case.
 ```javascript
 const puppeteer = require('puppeteer-core');
 const browser = await puppeteer.connect({browserWSEndpoint:'ws://127.0.0.1:9222'});
 const page = await (await browser.createBrowserContext()).newPage();
 await page.goto('https://example.com', {waitUntil:'networkidle0', timeout: 30000});
-// Accept cookie banners if present
-await page.evaluate(() => {
-  const btns = [...document.querySelectorAll('button')];
-  const accept = btns.find(b => /accept|aceptar|acepto/i.test(b.textContent));
-  if (accept) accept.click();
+const data = await page.evaluate(() => {
+  return [...document.querySelectorAll('article')].map(el => ({
+    title: el.querySelector('h2')?.textContent?.trim(),
+    link: el.querySelector('a')?.href,
+  })).filter(d => d.title);
 });
-await new Promise(r => setTimeout(r, 1000));
-const data = await page.evaluate(() => document.body.innerText);
 await page.close(); await browser.disconnect();
 ```
 
-### 2. Scrapling (Python, for TLS-impersonating requests)
-For sites that block bots based on TLS fingerprinting:
-```python
-from scrapling.fetchers import Fetcher
-page = Fetcher.get('https://example.com', impersonate='chrome')
-data = page.css('.selector::text').getall()
-```
-
-### 3. web_fetch (for simple, static pages only)
+### 5. web_fetch (for simple, static pages only)
 Only use web_fetch for pages that work without JavaScript (APIs, static HTML, RSS feeds).
 
 ### Scraping Strategy (FOLLOW THIS ORDER)
-1. **First try Puppeteer + Lightpanda** for any real estate portal, news site, or JS-heavy page
-2. If Puppeteer fails (CAPTCHA, anti-bot), try **Scrapling** with TLS impersonation
-3. Only fall back to **web_fetch** for simple/static pages or APIs
+1. **Scrapling Fetcher** — try this FIRST for any site (fastest, handles most anti-bot)
+2. **StealthyFetcher** — if Fetcher returns 403/empty (Cloudflare, anti-bot walls)
+3. **DynamicFetcher/Session** — if content requires JS rendering or multi-page sessions
+4. **Puppeteer + Lightpanda** — only if Python Scrapling isn't working
+5. **web_fetch** — only for simple/static pages or APIs
 
-**Works on**: Most JS-rendered sites, SPAs, Fotocasa, pisos.com, yaencontre, globaliza, nestoria, cookie walls.
-**Does NOT work on**: Idealista (DataDome CAPTCHA), Milanuncios (CAPTCHA).
+**Works on**: Fotocasa, pisos.com, Milanuncios, Yaencontre, Bolsa de Madrid, Investing.com, tech news, Amazon, Wallapop, Cloudflare-protected sites.
+**Does NOT work on ANY method**: Idealista (DataDome CAPTCHA — needs proxy rotation).
 
 ## Scheduling (Cron Jobs)
 

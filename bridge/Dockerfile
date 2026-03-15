@@ -13,11 +13,15 @@ RUN apt-get update && \
 # PDF: xhtml2pdf (HTML→PDF), markdown (MD→HTML), fpdf2 (simple PDFs)
 # Charts/Images: matplotlib, pillow
 # Other: qrcode (QR codes), icalendar (ICS calendar files)
-# Scraping: scrapling + curl_cffi for TLS-impersonating HTTP fetcher (no browsers needed)
+# Scraping: scrapling[fetchers] + curl_cffi for TLS-impersonating HTTP + stealth browser fetchers
 RUN pip3 install --no-cache-dir --break-system-packages \
     awscli fpdf2 xhtml2pdf markdown \
     matplotlib pillow qrcode icalendar \
-    scrapling curl_cffi openpyxl
+    "scrapling[fetchers]" curl_cffi openpyxl
+
+# Install Scrapling browser dependencies (Playwright Chromium + Camoufox for StealthyFetcher/DynamicFetcher)
+# This enables full browser automation with anti-bot bypass capabilities
+RUN python3 -c "from scrapling.cli import install; install([], standalone_mode=False)"
 
 # Create app directory
 RUN mkdir -p /app
@@ -67,9 +71,20 @@ RUN curl -L -o /usr/local/bin/lightpanda \
 # ============================================================
 FROM --platform=linux/arm64 public.ecr.aws/docker/library/node:22-slim
 
-# Install runtime system dependencies (pip3 for on-demand installs, libcairo2 for xhtml2pdf/pycairo)
+# Install runtime system dependencies
+# - curl, jq: utilities
+# - python3, python3-pip: Python runtime
+# - libcairo2: xhtml2pdf/pycairo rendering
+# - Playwright/Camoufox browser deps: libglib2.0-0, libnss3, libnspr4, libatk1.0-0,
+#   libatk-bridge2.0-0, libcups2, libdrm2, libdbus-1-3, libxcb1, libxkbcommon0,
+#   libatspi2.0-0, libx11-6, libxcomposite1, libxdamage1, libxext6, libxfixes3,
+#   libxrandr2, libgbm1, libpango-1.0-0, libasound2, libgtk-3-0
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl jq python3 python3-pip libcairo2 && \
+    apt-get install -y --no-install-recommends curl jq python3 python3-pip libcairo2 \
+        libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
+        libdrm2 libdbus-1-3 libxcb1 libxkbcommon0 libatspi2.0-0 libx11-6 \
+        libxcomposite1 libxdamage1 libxext6 libxfixes3 libxrandr2 libgbm1 \
+        libpango-1.0-0 libasound2 libgtk-3-0 && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy AWS CLI from builder
@@ -79,6 +94,10 @@ COPY --from=builder /usr/lib/python3/dist-packages /usr/lib/python3/dist-package
 
 # Copy Lightpanda browser binary from builder
 COPY --from=builder /usr/local/bin/lightpanda /usr/local/bin/lightpanda
+
+# Copy Scrapling/Playwright/Patchright browser binaries from builder
+# These are installed by `scrapling install` and live in /root/.cache/
+COPY --from=builder /root/.cache /root/.cache
 
 # Copy app directory (node_modules, compile cache)
 COPY --from=builder /app/node_modules /app/node_modules

@@ -517,7 +517,7 @@ describe("buildSubagentSystemPrompt", () => {
     assert.ok(result.includes("puppeteer"), "has Puppeteer reference");
     assert.ok(result.includes("Scrapling"), "has Scrapling reference");
     assert.ok(result.includes("NEVER kill"), "forbids killing Lightpanda");
-    assert.ok(result.includes("NEVER scrape `document.body.innerText`"), "forbids raw innerText");
+    assert.ok(result.includes("body.innerText"), "forbids raw innerText dumps");
     assert.ok(result.includes("targeted CSS selectors"), "promotes targeted extraction");
   });
 

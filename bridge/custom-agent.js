@@ -109,75 +109,88 @@ const SUBAGENT_CONTEXT_BASE =
   "- You have max 15 iterations — plan your approach to finish within 8-10 tool calls.\n";
 
 const SUBAGENT_CONTEXT_SCRAPING =
-  "\n## Web Scraping — Puppeteer + Lightpanda\n\n" +
-  "A shared Lightpanda headless browser is ALWAYS running at ws://127.0.0.1:9222 (CDP).\n" +
-  "**CRITICAL RULES:**\n" +
-  "- NEVER kill, restart, or pkill Lightpanda — it is a shared service used by all agents\n" +
-  "- If you get ECONNREFUSED, wait 2-3 seconds and retry — another agent may be temporarily using it\n" +
-  "- Always use `browser.createBrowserContext()` for isolation\n" +
-  "- Always close pages and disconnect when done\n\n" +
+  "\n## Web Scraping — Scrapling (Python, primary) + Puppeteer (fallback)\n\n" +
   "### EFFICIENCY IS CRITICAL — you have limited context\n\n" +
-  "**NEVER scrape `document.body.innerText` or `innerHTML`** — this dumps the entire page and wastes your context.\n" +
-  "**ALWAYS extract ONLY the specific data you need** using targeted CSS selectors or XPath:\n\n" +
-  "```javascript\n" +
-  "// GOOD — extract structured data with selectors\n" +
-  "const data = await page.evaluate(() => {\n" +
-  "  return [...document.querySelectorAll('.listing-card')].map(el => ({\n" +
-  "    title: el.querySelector('h2,.title')?.textContent?.trim(),\n" +
-  "    price: el.querySelector('.price,[class*=price]')?.textContent?.trim(),\n" +
-  "    link: el.querySelector('a')?.href,\n" +
-  "  })).filter(d => d.title);\n" +
-  "});\n" +
-  "console.log(JSON.stringify(data, null, 2));\n\n" +
-  "// BAD — do NOT do this:\n" +
-  "// const text = await page.evaluate(() => document.body.innerText); // dumps 50KB+ of junk\n" +
-  "```\n\n" +
-  "### Scraping pattern (use `exec` tool)\n" +
-  "Write a Node.js script to /tmp/ and run it. Process sites SEQUENTIALLY:\n" +
-  "```javascript\n" +
-  "const puppeteer = require('puppeteer-core');\n" +
-  "async function scrape(url) {\n" +
-  "  const browser = await puppeteer.connect({browserWSEndpoint:'ws://127.0.0.1:9222'});\n" +
-  "  const ctx = await browser.createBrowserContext();\n" +
-  "  const page = await ctx.newPage();\n" +
-  "  try {\n" +
-  "    await page.goto(url, {waitUntil:'networkidle0', timeout:30000});\n" +
-  "    // Handle cookie banners\n" +
-  "    await page.evaluate(() => {\n" +
-  "      const btn = [...document.querySelectorAll('button')].find(b => /accept|aceptar/i.test(b.textContent));\n" +
-  "      if(btn) btn.click();\n" +
-  "    });\n" +
-  "    await new Promise(r => setTimeout(r, 1000));\n" +
-  "    // EXTRACT ONLY what you need — use specific selectors!\n" +
-  "    return await page.evaluate(() => { /* your targeted extraction */ });\n" +
-  "  } finally { await page.close(); await browser.disconnect(); }\n" +
-  "}\n" +
-  "```\n" +
-  "**TIP**: Batch multiple URLs in ONE script call. Output compact JSON.\n\n" +
-  "### When you don't know the page structure\n" +
-  "If you're unsure of selectors, do a quick recon FIRST (one exec call):\n" +
-  "```javascript\n" +
-  "// Recon: get page structure without dumping all content\n" +
-  "const structure = await page.evaluate(() => {\n" +
-  "  const els = document.querySelectorAll('[class*=listing],[class*=card],[class*=item],[class*=result],[class*=product]');\n" +
-  "  if (els.length > 0) {\n" +
-  "    const sample = els[0];\n" +
-  "    return { count: els.length, sampleClass: sample.className, sampleHTML: sample.outerHTML.slice(0, 1000) };\n" +
-  "  }\n" +
-  "  // Fallback: show main content area structure\n" +
-  "  const main = document.querySelector('main,[role=main],#content,.content') || document.body;\n" +
-  "  return { tag: main.tagName, childTags: [...main.children].slice(0,10).map(c => c.tagName + '.' + c.className.split(' ')[0]) };\n" +
-  "});\n" +
-  "```\n" +
-  "Then write targeted extraction in the next call.\n\n" +
-  "### Fallback: Scrapling (Python, TLS-impersonating)\n" +
-  "Only if Puppeteer fails (CAPTCHA/anti-bot):\n" +
+  "**NEVER dump entire pages, `body.innerText`, or full HTML** — extract ONLY the specific data you need.\n" +
+  "**ALWAYS use targeted CSS selectors or XPath** to extract structured data.\n" +
+  "Output compact JSON. Batch multiple URLs in ONE script call.\n\n" +
+  "### Tier 1: Scrapling Fetcher (PREFERRED — fast, 100-1500ms)\n" +
+  "Use for MOST sites. HTTP request with Chrome TLS fingerprint impersonation.\n" +
+  "Works on: Fotocasa, pisos.com, Milanuncios, Investing.com, tech news, Amazon ES, Wallapop, CoinGecko.\n" +
   "```python\n" +
   "from scrapling.fetchers import Fetcher\n" +
-  "page = Fetcher.get('https://example.com', impersonate='chrome')\n" +
-  "data = page.css('.selector::text').getall()\n" +
+  "# Single page\n" +
+  "page = Fetcher.get('https://example.com', impersonate='chrome', stealthy_headers=True, follow_redirects=True)\n" +
+  "items = page.css('article').getall()           # CSS selector\n" +
+  "titles = page.css('h2 a::text').getall()       # extract text\n" +
+  "links = page.css('h2 a::attr(href)').getall()  # extract attributes\n" +
+  "# Structured extraction\n" +
+  "data = [{'title': el.css('h2::text').get(), 'price': el.css('.price::text').get()}\n" +
+  "        for el in page.css('article')]\n" +
+  "import json; print(json.dumps([d for d in data if d.get('title')], ensure_ascii=False))\n" +
+  "```\n\n" +
+  "### Tier 2: StealthyFetcher (anti-bot bypass, 2-10s)\n" +
+  "Full stealth browser with Cloudflare bypass. Use when Fetcher gets 403/blocked.\n" +
+  "Works on: Yaencontre, Bolsa de Madrid, Cloudflare-protected sites.\n" +
+  "```python\n" +
+  "from scrapling.fetchers import StealthyFetcher\n" +
+  "page = StealthyFetcher.fetch('https://hard-site.com', headless=True, network_idle=True,\n" +
+  "                              google_search=True, solve_cloudflare=True)\n" +
+  "data = page.css('article').getall()\n" +
+  "```\n\n" +
+  "### Tier 3: DynamicFetcher / DynamicSession (full browser, 3-30s)\n" +
+  "Full Playwright Chromium with all resources. Use for JS-heavy SPAs or when you need\n" +
+  "cookie consent interaction, scrolling, or multi-page sessions.\n" +
+  "```python\n" +
+  "from scrapling.fetchers import DynamicFetcher, DynamicSession\n" +
+  "# One-off\n" +
+  "page = DynamicFetcher.fetch('https://spa-site.com', headless=True, network_idle=True,\n" +
+  "                            disable_resources=False)\n" +
+  "# Persistent session (cookies carry over between pages)\n" +
+  "with DynamicSession(headless=True, disable_resources=False, network_idle=True) as session:\n" +
+  "    page1 = session.fetch('https://example.com/page1')\n" +
+  "    page2 = session.fetch('https://example.com/page2')\n" +
+  "```\n\n" +
+  "### Tier 4: Puppeteer + Lightpanda (last resort, JS rendering)\n" +
+  "A shared Lightpanda headless browser runs at ws://127.0.0.1:9222 (CDP).\n" +
+  "**CRITICAL:** NEVER kill/restart Lightpanda. Use `browser.createBrowserContext()` for isolation.\n" +
+  "If ECONNREFUSED, wait 2-3s and retry.\n" +
+  "```javascript\n" +
+  "const puppeteer = require('puppeteer-core');\n" +
+  "const browser = await puppeteer.connect({browserWSEndpoint:'ws://127.0.0.1:9222'});\n" +
+  "const ctx = await browser.createBrowserContext();\n" +
+  "const page = await ctx.newPage();\n" +
+  "try {\n" +
+  "  await page.goto(url, {waitUntil:'networkidle0', timeout:30000});\n" +
+  "  const data = await page.evaluate(() => {\n" +
+  "    return [...document.querySelectorAll('article')].map(el => ({\n" +
+  "      title: el.querySelector('h2')?.textContent?.trim(),\n" +
+  "      link: el.querySelector('a')?.href,\n" +
+  "    })).filter(d => d.title);\n" +
+  "  });\n" +
+  "  console.log(JSON.stringify(data, null, 2));\n" +
+  "} finally { await page.close(); await browser.disconnect(); }\n" +
+  "```\n\n" +
+  "### Scraping Strategy (FOLLOW THIS ORDER)\n" +
+  "1. **Scrapling Fetcher** — try this FIRST for any site (fastest, handles most anti-bot)\n" +
+  "2. **StealthyFetcher** — if Fetcher returns 403/empty (Cloudflare, anti-bot walls)\n" +
+  "3. **DynamicFetcher/Session** — if content requires JS rendering or multi-page sessions\n" +
+  "4. **Puppeteer + Lightpanda** — only if Python Scrapling isn't working\n\n" +
+  "### When you don't know the page structure\n" +
+  "Do a quick recon FIRST:\n" +
+  "```python\n" +
+  "from scrapling.fetchers import Fetcher\n" +
+  "page = Fetcher.get(url, impersonate='chrome')\n" +
+  "# Check for common listing patterns\n" +
+  "for sel in ['article', '[class*=card]', '[class*=listing]', '[class*=item]', '[class*=result]']:\n" +
+  "    items = page.css(sel)\n" +
+  "    if items:\n" +
+  "        sample = items[0]\n" +
+  "        print(f'{sel}: {len(items)} items, sample HTML: {str(sample)[:500]}')\n" +
+  "        break\n" +
   "```\n" +
-  "Does NOT work on: Idealista (DataDome), Milanuncios (CAPTCHA).\n";
+  "Then write targeted extraction in the next call.\n\n" +
+  "**Does NOT work on ANY method**: Idealista (DataDome CAPTCHA — needs proxy rotation).\n";
 
 const SUBAGENT_CONTEXT_DATA =
   "\n## File Generation\n\n" +
