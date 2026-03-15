@@ -507,6 +507,8 @@ describe("buildSubagentSystemPrompt", () => {
     assert.ok(result.includes("[SEND_FILE:filename]"), "has file delivery rule");
     assert.ok(result.includes("Scrape fotocasa.es"), "has task description");
     assert.ok(result.includes("YOUR TASK"), "has task header");
+    assert.ok(result.includes("EFFICIENCY"), "has efficiency section");
+    assert.ok(result.includes("limited context"), "warns about context limits");
   });
 
   it("includes scraping context for web_scraping tool set", () => {
@@ -515,7 +517,8 @@ describe("buildSubagentSystemPrompt", () => {
     assert.ok(result.includes("puppeteer"), "has Puppeteer reference");
     assert.ok(result.includes("Scrapling"), "has Scrapling reference");
     assert.ok(result.includes("NEVER kill"), "forbids killing Lightpanda");
-    assert.ok(result.includes("NEVER run `pkill"), "forbids pkill command");
+    assert.ok(result.includes("NEVER scrape `document.body.innerText`"), "forbids raw innerText");
+    assert.ok(result.includes("targeted CSS selectors"), "promotes targeted extraction");
   });
 
   it("includes scraping context for research tool set", () => {
@@ -787,6 +790,87 @@ describe("chat", () => {
     agent.conversationHistory.push({ role: "test", content: "test" });
     agent.resetHistory();
     assert.equal(agent.conversationHistory.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// smartTruncate
+// ---------------------------------------------------------------------------
+
+describe("smartTruncate", () => {
+  it("is a function", () => {
+    assert.equal(typeof agent.smartTruncate, "function");
+  });
+
+  it("returns text unchanged when under limit", () => {
+    const text = "short text";
+    assert.equal(agent.smartTruncate(text, 1000), text);
+  });
+
+  it("returns text unchanged when exactly at limit", () => {
+    const text = "x".repeat(100);
+    assert.equal(agent.smartTruncate(text, 100), text);
+  });
+
+  it("truncates long text with head and tail", () => {
+    const text = "HEAD_" + "x".repeat(1000) + "_TAIL";
+    const result = agent.smartTruncate(text, 200);
+    assert.ok(result.length <= 200, `result length ${result.length} exceeds limit 200`);
+    assert.ok(result.startsWith("HEAD_"), "preserves head");
+    assert.ok(result.endsWith("_TAIL"), "preserves tail");
+    assert.ok(result.includes("TRUNCATED"), "includes truncation marker");
+  });
+
+  it("includes original length in truncation marker", () => {
+    const text = "a".repeat(50000);
+    const result = agent.smartTruncate(text, 1000);
+    assert.ok(result.includes("50,000"), "shows original length formatted");
+  });
+
+  it("head portion is larger than tail (70/30 split)", () => {
+    const text = "a".repeat(10000);
+    const result = agent.smartTruncate(text, 1000);
+    const markerIdx = result.indexOf("[...");
+    const tailStart = result.lastIndexOf("...]") + 4;
+    // Head should be ~70% of available space, tail ~30%
+    assert.ok(markerIdx > tailStart - markerIdx, "head is larger than tail portion");
+  });
+
+  it("handles empty string", () => {
+    assert.equal(agent.smartTruncate("", 100), "");
+  });
+
+  it("handles null/undefined", () => {
+    assert.equal(agent.smartTruncate(null, 100), null);
+    assert.equal(agent.smartTruncate(undefined, 100), undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sub-agent efficiency constants
+// ---------------------------------------------------------------------------
+
+describe("sub-agent efficiency constants", () => {
+  it("MAX_SUBAGENT_TOOL_RESULT_CHARS is exported and less than main agent limit", () => {
+    assert.equal(typeof agent.MAX_SUBAGENT_TOOL_RESULT_CHARS, "number");
+    assert.ok(agent.MAX_SUBAGENT_TOOL_RESULT_CHARS < agent.MAX_TOOL_RESULT_CHARS,
+      "sub-agent limit should be stricter than main agent");
+  });
+
+  it("MAX_SUBAGENT_TOOL_RESULT_CHARS is reasonable (10K-50K range)", () => {
+    assert.ok(agent.MAX_SUBAGENT_TOOL_RESULT_CHARS >= 10000, "at least 10KB");
+    assert.ok(agent.MAX_SUBAGENT_TOOL_RESULT_CHARS <= 50000, "at most 50KB");
+  });
+
+  it("MAX_SUBAGENT_CONTEXT_CHARS is exported and less than main agent limit", () => {
+    assert.equal(typeof agent.MAX_SUBAGENT_CONTEXT_CHARS, "number");
+    assert.ok(agent.MAX_SUBAGENT_CONTEXT_CHARS < agent.MAX_CONTEXT_CHARS,
+      "sub-agent context limit should be stricter than main agent");
+  });
+
+  it("MAX_SUBAGENT_CONTEXT_CHARS is reasonable (100K-400K range)", () => {
+    assert.ok(agent.MAX_SUBAGENT_CONTEXT_CHARS >= 100000, "at least 100K");
+    assert.ok(agent.MAX_SUBAGENT_CONTEXT_CHARS <= 400000, "at most 400K");
   });
 });
 

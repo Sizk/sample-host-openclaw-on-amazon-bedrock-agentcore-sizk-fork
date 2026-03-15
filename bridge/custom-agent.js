@@ -46,6 +46,8 @@ const MAX_TOOL_RESULT_CHARS = 100000; // Truncate tool results over 100KB
 // Sub-agents
 const MAX_CONCURRENT_SUBAGENTS = 3;
 const SUBAGENT_MODEL = "bedrock-agentcore-subagent";
+const MAX_SUBAGENT_TOOL_RESULT_CHARS = 30000; // Sub-agents get 30KB (vs 100KB for main agent)
+const MAX_SUBAGENT_CONTEXT_CHARS = 200000; // ~50K tokens — sub-agents have tighter budgets
 
 // ---------------------------------------------------------------------------
 // Sub-agent status tracking — shared state for real-time progress reporting
@@ -72,6 +74,22 @@ function getSubagentStatus() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Smart truncation — preserves beginning and end of large outputs so models
+// can see the overall structure (headers, first results) and the tail (errors,
+// summary lines, final records).
+// ---------------------------------------------------------------------------
+function smartTruncate(text, maxChars) {
+  if (!text || text.length <= maxChars) return text;
+  // Reserve 70% for head, 30% for tail — head is more important (structure, errors)
+  const marker = "\n\n[... TRUNCATED — output was " + text.length.toLocaleString() + " chars, showing first and last portions ...]\n\n";
+  const available = maxChars - marker.length;
+  if (available <= 0) return text.substring(0, maxChars);
+  const headSize = Math.floor(available * 0.7);
+  const tailSize = available - headSize;
+  return text.substring(0, headSize) + marker + text.substring(text.length - tailSize);
+}
+
 // Sub-agent context blocks — injected as system prompt prefix so sub-agents
 // get critical operational knowledge that only the main agent receives via CLAUDE.md.
 const SUBAGENT_CONTEXT_BASE =
@@ -81,48 +99,85 @@ const SUBAGENT_CONTEXT_BASE =
   "- NEVER share local filesystem paths (/root/..., /tmp/...) — users cannot access the container\n" +
   "- NEVER generate presigned S3 URLs or s3:// URIs\n" +
   "- To deliver files: create at /tmp/, upload with write_user_file, include [SEND_FILE:filename] in output\n" +
-  "- For large content, use bash heredoc to write to /tmp/ then upload with file_path\n";
+  "- For large content, use bash heredoc to write to /tmp/ then upload with file_path\n\n" +
+  "## EFFICIENCY — you have a limited context window\n\n" +
+  "- Tool output is truncated to ~30KB. Plan accordingly — extract ONLY the data you need.\n" +
+  "- NEVER dump entire pages, full HTML, or raw innerText. Use targeted selectors/extraction.\n" +
+  "- Prefer structured JSON output from scripts over raw text dumps.\n" +
+  "- Batch operations: process multiple items in ONE exec call, not one per call.\n" +
+  "- If a command produces too much output, pipe through `head -n 100` or filter with grep.\n" +
+  "- You have max 15 iterations — plan your approach to finish within 8-10 tool calls.\n";
 
 const SUBAGENT_CONTEXT_SCRAPING =
   "\n## Web Scraping — Puppeteer + Lightpanda\n\n" +
   "A shared Lightpanda headless browser is ALWAYS running at ws://127.0.0.1:9222 (CDP).\n" +
   "**CRITICAL RULES:**\n" +
   "- NEVER kill, restart, or pkill Lightpanda — it is a shared service used by all agents\n" +
-  "- NEVER run `pkill lightpanda` or `killall lightpanda` or restart it in any way\n" +
   "- If you get ECONNREFUSED, wait 2-3 seconds and retry — another agent may be temporarily using it\n" +
-  "- Always use `browser.createBrowserContext()` for isolation — each page gets its own context\n" +
-  "- Always close pages and disconnect when done to free resources for other agents\n\n" +
-  "### Scraping with Puppeteer (use `exec` tool)\n" +
-  "Write a Node.js script to /tmp/ and run it. Process sites SEQUENTIALLY (one at a time):\n" +
+  "- Always use `browser.createBrowserContext()` for isolation\n" +
+  "- Always close pages and disconnect when done\n\n" +
+  "### EFFICIENCY IS CRITICAL — you have limited context\n\n" +
+  "**NEVER scrape `document.body.innerText` or `innerHTML`** — this dumps the entire page and wastes your context.\n" +
+  "**ALWAYS extract ONLY the specific data you need** using targeted CSS selectors or XPath:\n\n" +
+  "```javascript\n" +
+  "// GOOD — extract structured data with selectors\n" +
+  "const data = await page.evaluate(() => {\n" +
+  "  return [...document.querySelectorAll('.listing-card')].map(el => ({\n" +
+  "    title: el.querySelector('h2,.title')?.textContent?.trim(),\n" +
+  "    price: el.querySelector('.price,[class*=price]')?.textContent?.trim(),\n" +
+  "    link: el.querySelector('a')?.href,\n" +
+  "  })).filter(d => d.title);\n" +
+  "});\n" +
+  "console.log(JSON.stringify(data, null, 2));\n\n" +
+  "// BAD — do NOT do this:\n" +
+  "// const text = await page.evaluate(() => document.body.innerText); // dumps 50KB+ of junk\n" +
+  "```\n\n" +
+  "### Scraping pattern (use `exec` tool)\n" +
+  "Write a Node.js script to /tmp/ and run it. Process sites SEQUENTIALLY:\n" +
   "```javascript\n" +
   "const puppeteer = require('puppeteer-core');\n" +
-  "const urls = ['https://site1.com', 'https://site2.com'];\n" +
-  "const results = [];\n" +
-  "for (const url of urls) {\n" +
-  "  let browser;\n" +
+  "async function scrape(url) {\n" +
+  "  const browser = await puppeteer.connect({browserWSEndpoint:'ws://127.0.0.1:9222'});\n" +
+  "  const ctx = await browser.createBrowserContext();\n" +
+  "  const page = await ctx.newPage();\n" +
   "  try {\n" +
-  "    browser = await puppeteer.connect({browserWSEndpoint:'ws://127.0.0.1:9222'});\n" +
-  "    const ctx = await browser.createBrowserContext();\n" +
-  "    const page = await ctx.newPage();\n" +
   "    await page.goto(url, {waitUntil:'networkidle0', timeout:30000});\n" +
-  "    const text = await page.evaluate(() => document.body.innerText);\n" +
-  "    results.push({url, ok: true, snippet: text.slice(0,500)});\n" +
-  "    await page.close();\n" +
-  "  } catch(e) { results.push({url, ok: false, error: e.message}); }\n" +
-  "  finally { if(browser) await browser.disconnect(); }\n" +
+  "    // Handle cookie banners\n" +
+  "    await page.evaluate(() => {\n" +
+  "      const btn = [...document.querySelectorAll('button')].find(b => /accept|aceptar/i.test(b.textContent));\n" +
+  "      if(btn) btn.click();\n" +
+  "    });\n" +
+  "    await new Promise(r => setTimeout(r, 1000));\n" +
+  "    // EXTRACT ONLY what you need — use specific selectors!\n" +
+  "    return await page.evaluate(() => { /* your targeted extraction */ });\n" +
+  "  } finally { await page.close(); await browser.disconnect(); }\n" +
   "}\n" +
-  "console.log(JSON.stringify(results, null, 2));\n" +
   "```\n" +
-  "**TIP**: For batch testing many sites, write ONE script that loops through all URLs and outputs structured JSON.\n" +
-  "This is much more efficient than calling `exec` once per URL.\n\n" +
+  "**TIP**: Batch multiple URLs in ONE script call. Output compact JSON.\n\n" +
+  "### When you don't know the page structure\n" +
+  "If you're unsure of selectors, do a quick recon FIRST (one exec call):\n" +
+  "```javascript\n" +
+  "// Recon: get page structure without dumping all content\n" +
+  "const structure = await page.evaluate(() => {\n" +
+  "  const els = document.querySelectorAll('[class*=listing],[class*=card],[class*=item],[class*=result],[class*=product]');\n" +
+  "  if (els.length > 0) {\n" +
+  "    const sample = els[0];\n" +
+  "    return { count: els.length, sampleClass: sample.className, sampleHTML: sample.outerHTML.slice(0, 1000) };\n" +
+  "  }\n" +
+  "  // Fallback: show main content area structure\n" +
+  "  const main = document.querySelector('main,[role=main],#content,.content') || document.body;\n" +
+  "  return { tag: main.tagName, childTags: [...main.children].slice(0,10).map(c => c.tagName + '.' + c.className.split(' ')[0]) };\n" +
+  "});\n" +
+  "```\n" +
+  "Then write targeted extraction in the next call.\n\n" +
   "### Fallback: Scrapling (Python, TLS-impersonating)\n" +
-  "Only if Puppeteer fails due to CAPTCHA or anti-bot:\n" +
+  "Only if Puppeteer fails (CAPTCHA/anti-bot):\n" +
   "```python\n" +
   "from scrapling.fetchers import Fetcher\n" +
   "page = Fetcher.get('https://example.com', impersonate='chrome')\n" +
   "data = page.css('.selector::text').getall()\n" +
-  "```\n\n" +
-  "Does NOT work on: Idealista (DataDome CAPTCHA), Milanuncios (CAPTCHA).\n";
+  "```\n" +
+  "Does NOT work on: Idealista (DataDome), Milanuncios (CAPTCHA).\n";
 
 const SUBAGENT_CONTEXT_DATA =
   "\n## File Generation\n\n" +
@@ -1052,8 +1107,39 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
       messages.push({
         role: "tool",
         tool_call_id: toolCall.id,
-        content: (result || "").substring(0, MAX_TOOL_RESULT_CHARS),
+        content: smartTruncate(result || "", MAX_SUBAGENT_TOOL_RESULT_CHARS),
       });
+    }
+
+    // Sub-agent context trimming — drop oldest complete turns if context grows too large.
+    // A "turn" = one assistant message (with tool_calls) + all its tool response messages.
+    // We must remove complete turns to avoid orphaned tool_call_id references.
+    const contextSize = messages.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : JSON.stringify(m).length), 0);
+    if (contextSize > MAX_SUBAGENT_CONTEXT_CHARS && messages.length > 6) {
+      // Identify turn boundaries starting after system (0) + user (1).
+      // Each turn starts with an assistant message that has tool_calls.
+      const turns = []; // [{start, end}] — inclusive indices
+      for (let j = 2; j < messages.length; j++) {
+        if (messages[j].role === "assistant") {
+          const turnStart = j;
+          let turnEnd = j;
+          // Collect all subsequent tool messages that belong to this assistant turn
+          while (turnEnd + 1 < messages.length && messages[turnEnd + 1].role === "tool") {
+            turnEnd++;
+          }
+          turns.push({ start: turnStart, end: turnEnd });
+          j = turnEnd; // skip past tool messages
+        }
+      }
+      // Remove oldest turns (keep at least the last 2 turns for recent context)
+      const removableTurns = Math.max(0, turns.length - 2);
+      if (removableTurns > 0) {
+        const turnsToRemove = Math.ceil(removableTurns / 2); // remove half the removable turns
+        const lastRemoved = turns[turnsToRemove - 1];
+        const removeCount = lastRemoved.end - turns[0].start + 1;
+        messages.splice(turns[0].start, removeCount);
+        console.log(`[subagent] Trimmed ${turnsToRemove} turn(s) (${removeCount} messages), context was ${contextSize} chars`);
+      }
     }
   }
   if (subagentStatus.agents[agentIndex]) {
@@ -1328,5 +1414,8 @@ module.exports = {
   MIN_KEEP_MESSAGES,
   MAX_TOOL_RESULT_CHARS,
   MAX_CONCURRENT_SUBAGENTS,
+  MAX_SUBAGENT_TOOL_RESULT_CHARS,
+  MAX_SUBAGENT_CONTEXT_CHARS,
   SUBAGENT_TOOL_SETS,
+  smartTruncate,
 };
