@@ -528,29 +528,23 @@ async function deliverResponse(channel, chatId, text, files, tokens, draftId) {
   if (channel === "telegram") {
     const token = tokens.telegram;
 
+    // ALWAYS send the final response as a real sendMessage — never rely on drafts
+    // for the permanent message. Drafts are ephemeral and can vanish if HTML parsing
+    // fails, leaving the user with "Deleted message". sendMessage has HTML -> plain
+    // text fallback, so it ALWAYS succeeds. The streaming draft will auto-disappear
+    // when the real message arrives.
     if (draftId) {
-      // Streaming was active — finalize by sending one last draft with HTML formatting.
-      // This replaces the streaming draft in-place. Do NOT call sendMessage (creates duplicate).
-      const htmlText = markdownToTelegramHtml(cleanText);
-      if (cleanText.length <= 4096) {
-        await sendTelegramDraft(chatId, htmlText, token, draftId, "HTML");
-      } else {
-        // For long messages, send first chunk as final draft, rest as regular messages
-        await sendTelegramDraft(chatId, markdownToTelegramHtml(cleanText.slice(0, 4096)), token, draftId, "HTML");
-        for (let i = 4096; i < cleanText.length; i += 4096) {
-          await sendTelegramMessage(chatId, cleanText.slice(i, i + 4096), token);
-        }
-      }
-    } else if (cleanText.length <= 4096) {
+      // Clear the streaming draft by sending an empty-ish draft before the real message.
+      // This prevents a brief moment where both draft and message are visible.
+      await sendTelegramDraft(chatId, "...", token, draftId);
+    }
+
+    if (cleanText.length <= 4096) {
       await sendTelegramMessage(chatId, cleanText, token);
     } else {
       // Split into 4096-char chunks
       for (let i = 0; i < cleanText.length; i += 4096) {
-        await sendTelegramMessage(
-          chatId,
-          cleanText.slice(i, i + 4096),
-          token,
-        );
+        await sendTelegramMessage(chatId, cleanText.slice(i, i + 4096), token);
       }
     }
     await sendResponseFiles(files, channel, chatId, tokens);
