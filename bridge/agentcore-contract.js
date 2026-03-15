@@ -791,16 +791,18 @@ function isStatusQuery(text) {
   if (!text || typeof text !== "string") return false;
   const lower = text.toLowerCase().trim();
   const patterns = [
-    /^(como|cómo)\s+(va|vas|vamos)/,
-    /^(que|qué)\s+tal\s+(va|vas)/,
-    /^(how('s| is|s)?\s+(it|that|the task)?\s*(going|progressing|doing))/,
-    /^status\b/,
-    /^progress\b/,
-    /\?{2,}$/,                       // ends with "??" — probably asking about status
-    /^(sigues|estas|estás)\s+(ahí|ahi|trabajando)/,
-    /^(still|are you)\s+(there|working|running)/,
-    /^(en que|en qué)\s+(andas|vas|estas|estás)/,
-    /^(what'?s?\s+happening|what are you doing)/,
+    /^(como|cómo)\s+(va|vas|vamos)/,          // Spanish: "como va", "como vas", "como vamos"
+    /^(que|qué)\s+tal\s+(va|vas)/,             // Spanish: "que tal va", "que tal vas"
+    /^(how('s| is|s)?\s+(it|that|the task)?\s*(going|progressing|doing))/,  // English
+    /^status\b/,                                // "status", "status?"
+    /^progress\b/,                              // "progress", "progress?"
+    /^\?+$/,                                    // just question marks: "?", "??", "???"
+    /^(sigues|estas|estás)\s+(ahí|ahi|trabajando)/,  // Spanish: "sigues ahi"
+    /^(still|are you)\s+(there|working|running)/,     // English: "still there"
+    /^(en que|en qué)\s+(andas|vas|estas|estás)/,     // Spanish: "en que andas"
+    /^(what'?s?\s+happening|what are you doing)/,     // English
+    /^(como|cómo)\s+va\s+(el|la|eso)/,         // Spanish: "como va el tema", "como va eso"
+    /^(que|qué)\s+(haces|estas haciendo|estás haciendo)/, // Spanish: "que haces", "que estas haciendo"
   ];
   return patterns.some((p) => p.test(lower));
 }
@@ -835,9 +837,9 @@ function formatSubagentStatus(status) {
 async function drainQueue() {
   while (messageQueue.length > 0) {
     const next = messageQueue.shift();
-    console.log(`[contract] Processing queued message (${messageQueue.length} remaining)`);
+    console.log(`[contract] Processing queued message (${messageQueue.length} remaining, isCron=${!!next.isCron})`);
     try {
-      await processAndDeliver(next.messageText, next.actorId, next.channel, next.chatId);
+      await processAndDeliver(next.messageText, next.actorId, next.channel, next.chatId, { isCron: !!next.isCron });
     } catch (err) {
       console.error(`[contract] Queued processAndDeliver error: ${err.message}`);
     }
@@ -852,7 +854,8 @@ async function drainQueue() {
  * Routes all messages through custom agent. Handles typing indicators,
  * Telegram streaming drafts, file extraction, and delivery via channel-sender.js.
  */
-async function processAndDeliver(messageText, actorId, channel, chatId) {
+async function processAndDeliver(messageText, actorId, channel, chatId, options = {}) {
+  const { isCron = false } = options;
   const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
   const isTelegram = channel === "telegram" && TELEGRAM_BOT_TOKEN;
 
@@ -890,8 +893,8 @@ async function processAndDeliver(messageText, actorId, channel, chatId) {
     }, 4000);
   }
 
-  // One-time progress message after 30s (only if streaming hasn't started)
-  const progressTimer = setTimeout(async () => {
+  // One-time progress message after 30s (only if streaming hasn't started, and NOT for cron tasks)
+  const progressTimer = isCron ? null : setTimeout(async () => {
     if (streamingActive) return;
     const msg =
       "\u23f3 Working on your request \u2014 this may take a few minutes. " +
@@ -1115,14 +1118,34 @@ const server = http.createServer(async (req, res) => {
 
           // --- Async mode (chatId present): return immediately, deliver in background ---
           if (chatId) {
-            console.log(`[contract] Cron async mode: chatId=${chatId} channel=${channel}`);
+            console.log(`[contract] Cron async mode: chatId=${chatId} channel=${channel} busy=${chatBusy}`);
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "accepted", userId: currentUserId }));
 
-            // Process and deliver in background (fire-and-forget)
-            processAndDeliver(message, actorId, channel, chatId).catch((err) => {
-              console.error(`[contract] Cron processAndDeliver error: ${err.message}`);
-            });
+            // If agent is already busy (another cron or user message), queue the cron message
+            if (chatBusy) {
+              console.log(`[contract] Agent busy — queuing cron message (queue size: ${messageQueue.length})`);
+              messageQueue.push({ messageText: message, actorId, channel, chatId, isCron: true });
+              return;
+            }
+
+            // Process cron in background with chatBusy lock (same as chat messages)
+            chatBusy = true;
+            processAndDeliver(message, actorId, channel, chatId, { isCron: true })
+              .catch((err) => {
+                console.error(`[contract] Cron processAndDeliver error: ${err.message}`);
+              })
+              .then(() => {
+                // Drain any queued messages (user or cron)
+                if (messageQueue.length > 0) {
+                  drainQueue().catch((err) => {
+                    console.error(`[contract] drainQueue error: ${err.message}`);
+                    chatBusy = false;
+                  });
+                } else {
+                  chatBusy = false;
+                }
+              });
             return;
           }
 
