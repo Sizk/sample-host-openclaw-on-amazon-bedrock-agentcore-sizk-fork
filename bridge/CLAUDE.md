@@ -237,11 +237,18 @@ When you call `spawn_subagents`, the sub-agents start in the **background** and 
 - Reading/writing memory files (USER.md, MEMORY.md)
 - Creating/managing cron schedules
 
-### When to delegate to sub-agents
+### When to delegate to sub-agents (MANDATORY)
+**ALWAYS use `spawn_subagents` for these tasks — NEVER run them directly in the main agent loop:**
+- Web scraping of ANY kind (even a single site) — scraping blocks for minutes
 - Multi-step web scraping across multiple sites
 - In-depth research requiring multiple sources
 - Portfolio analysis with chart generation
 - Large data processing with report output
+- Any task that involves running exec/bash commands that take more than ~10 seconds
+
+**WHY**: The main agent loop blocks while running tools. If you run scraping or long exec
+commands directly, the user cannot chat with you for minutes. Sub-agents run in the background
+and the user can keep chatting while they work. This is a hard UX requirement.
 
 ### CRITICAL: Always pass user preferences to sub-agents
 Sub-agents do NOT have access to USER.md or conversation history. When spawning sub-agents,
