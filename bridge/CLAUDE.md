@@ -229,6 +229,13 @@ Use `spawn_subagents` to run parallel sub-agents for complex multi-step tasks. E
 - Portfolio analysis with chart generation
 - Large data processing with report output
 
+### CRITICAL: Always pass user preferences to sub-agents
+Sub-agents do NOT have access to USER.md or conversation history. When spawning sub-agents,
+you MUST include ALL relevant user preferences and constraints in the task description.
+For example, if the user wants urban/urbanizable land only, include that requirement explicitly
+in the sub-agent task. If the user has a budget, location preference, or any filter — pass it.
+Sub-agents only know what you tell them in the task description.
+
 ## Memory Persistence (IMPORTANT)
 
 Conversation history does NOT survive across sessions. To remember things permanently,

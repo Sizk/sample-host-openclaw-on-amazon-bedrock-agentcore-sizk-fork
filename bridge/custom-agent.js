@@ -490,6 +490,9 @@ const TOOLS = [
         "Each sub-agent runs independently with its own Bedrock conversation loop. " +
         "Use for complex multi-step tasks that benefit from parallel execution. " +
         "Sub-agents have access to: exec, web_fetch, web_search, read_file, and user file tools. " +
+        "IMPORTANT: Sub-agents do NOT see USER.md or conversation history — you MUST include " +
+        "ALL relevant user preferences, constraints, and filters in each task description " +
+        "(e.g. budget, location, land type, language). " +
         "Results from all sub-agents are combined and returned.",
       parameters: {
         type: "object",
@@ -502,7 +505,9 @@ const TOOLS = [
               properties: {
                 description: {
                   type: "string",
-                  description: "Detailed instructions for the sub-agent. Be specific about what to do and what to return.",
+                  description: "Detailed instructions for the sub-agent. Be specific about what to do and what to return. " +
+                    "Include ALL user preferences and constraints (budget, location, filters, language, etc.) — " +
+                    "sub-agents cannot see USER.md or conversation history.",
                 },
                 tool_set: {
                   type: "string",
