@@ -587,28 +587,30 @@ describe("buildSubagentSystemPrompt", () => {
 });
 
 // ---------------------------------------------------------------------------
-// subagentStatus and getSubagentStatus
+// subagentStatus and getSubagentStatus (per-batch tracking)
 // ---------------------------------------------------------------------------
 
 describe("subagentStatus", () => {
   it("is initially inactive", () => {
     assert.equal(agent.subagentStatus.active, false);
-    assert.deepStrictEqual(agent.subagentStatus.agents, []);
+    assert.equal(agent.activeBatchStatuses.size, 0);
   });
 
   it("getSubagentStatus returns null when inactive", () => {
-    agent.subagentStatus.active = false;
+    agent.activeBatchStatuses.clear();
     assert.equal(agent.getSubagentStatus(), null);
   });
 
   it("getSubagentStatus returns snapshot when active", () => {
-    agent.subagentStatus.active = true;
-    agent.subagentStatus.startedAt = Date.now() - 5000;
-    agent.subagentStatus.mainTask = "Scrape 100 websites";
-    agent.subagentStatus.agents = [
-      { id: 1, toolSet: "web_scraping", description: "Scrape batch 1", iteration: 3, maxIterations: 15, lastTool: "web_fetch", lastToolArg: "https://example.com", status: "running" },
-      { id: 2, toolSet: "web_scraping", description: "Scrape batch 2", iteration: 7, maxIterations: 15, lastTool: "exec", lastToolArg: "node puppeteer.js", status: "running" },
-    ];
+    // Simulate an active batch by adding directly to activeBatchStatuses
+    agent.activeBatchStatuses.set(99, {
+      startedAt: Date.now() - 5000,
+      mainTask: "Scrape 100 websites",
+      agents: [
+        { id: 1, toolSet: "web_scraping", description: "Scrape batch 1", iteration: 3, maxIterations: 15, lastTool: "web_fetch", lastToolArg: "https://example.com", status: "running" },
+        { id: 2, toolSet: "web_scraping", description: "Scrape batch 2", iteration: 7, maxIterations: 15, lastTool: "exec", lastToolArg: "node puppeteer.js", status: "running" },
+      ],
+    });
     const snapshot = agent.getSubagentStatus();
     assert.ok(snapshot.active);
     assert.ok(snapshot.elapsedSeconds >= 4 && snapshot.elapsedSeconds <= 10);
@@ -619,12 +621,10 @@ describe("subagentStatus", () => {
 
     // Verify it's a snapshot (modifying it doesn't affect original)
     snapshot.agents[0].iteration = 999;
-    assert.equal(agent.subagentStatus.agents[0].iteration, 3);
+    assert.equal(agent.activeBatchStatuses.get(99).agents[0].iteration, 3);
 
     // Clean up
-    agent.subagentStatus.active = false;
-    agent.subagentStatus.agents = [];
-    agent.subagentStatus.mainTask = "";
+    agent.activeBatchStatuses.clear();
   });
 });
 
@@ -892,5 +892,71 @@ describe("executeSpawnSubagents", () => {
     const result = await agent.executeSpawnSubagents({ tasks }, "user1");
     assert.ok(result.includes("Error:"));
     assert.ok(result.includes("Maximum"));
+  });
+
+  it("returns immediately with dispatched message (async, non-blocking)", async () => {
+    // This test verifies executeSpawnSubagents returns immediately
+    // without waiting for sub-agents to finish
+    const tasks = [{ description: "test task 1", tool_set: "general" }];
+    const start = Date.now();
+    const result = await agent.executeSpawnSubagents({ tasks }, "user1");
+    const elapsed = Date.now() - start;
+
+    // Should return almost immediately (not wait for sub-agents)
+    assert.ok(elapsed < 1000, `Should return quickly, took ${elapsed}ms`);
+    assert.ok(result.includes("dispatched"), "Should mention dispatched");
+    assert.ok(result.includes("background"), "Should mention background");
+    assert.ok(result.includes("test task 1"), "Should include task summary");
+
+    // subagentStatus should be active (sub-agents running in background)
+    assert.ok(agent.subagentStatus.active, "Sub-agents should be active in background");
+    assert.ok(agent.activeBatchStatuses.size > 0, "Should have active batch in activeBatchStatuses");
+
+    // Wait a bit for background promises to settle (they'll fail since no proxy)
+    await new Promise((r) => setTimeout(r, 500));
+  });
+
+  it("emits subagents-complete event when background sub-agents finish", async () => {
+    let eventFired = false;
+    let eventData = null;
+
+    const listener = (data) => {
+      eventFired = true;
+      eventData = data;
+    };
+    agent.agentEvents.on("subagents-complete", listener);
+
+    try {
+      const tasks = [{ description: "emit test task", tool_set: "general" }];
+      await agent.executeSpawnSubagents({ tasks }, "user1");
+
+      // Wait for background sub-agents to complete (they'll error since no proxy,
+      // and retry logic adds ~6s per failed sub-agent: 3 attempts with 2s/4s delays)
+      await new Promise((r) => setTimeout(r, 15000));
+
+      assert.ok(eventFired, "subagents-complete event should have fired");
+      assert.ok(eventData.batchId > 0, "Event should have a batchId");
+      assert.ok(typeof eventData.results === "string", "Event should have results string");
+      assert.ok(eventData.channelContext, "Event should include channelContext");
+      assert.ok("chatId" in eventData.channelContext, "channelContext should have chatId");
+      assert.ok("channel" in eventData.channelContext, "channelContext should have channel");
+      assert.ok("actorId" in eventData.channelContext, "channelContext should have actorId");
+    } finally {
+      agent.agentEvents.removeListener("subagents-complete", listener);
+    }
+  });
+
+  it("tracks pending batches during execution", async () => {
+    const tasks = [{ description: "batch tracking test", tool_set: "general" }];
+    await agent.executeSpawnSubagents({ tasks }, "user1");
+
+    // Batch should be tracked
+    assert.ok(agent.pendingBatches.size > 0, "Should have pending batch");
+
+    // Wait for completion (proxy retries take ~6s)
+    await new Promise((r) => setTimeout(r, 15000));
+
+    // Batch should be cleared
+    assert.equal(agent.pendingBatches.size, 0, "Pending batches should be cleared after completion");
   });
 });

@@ -17,7 +17,15 @@
 const http = require("http");
 const https = require("https");
 const { execFile, spawn } = require("child_process");
+const { EventEmitter } = require("events");
 const lightpandaFetch = require("./lightpanda-fetch");
+
+// ---------------------------------------------------------------------------
+// Event system — used to notify the contract server when background sub-agents
+// complete so it can trigger a new chat() call to format/deliver results.
+// ---------------------------------------------------------------------------
+
+const agentEvents = new EventEmitter();
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -49,30 +57,53 @@ const SUBAGENT_MODEL = "bedrock-agentcore-subagent";
 const MAX_SUBAGENT_TOOL_RESULT_CHARS = 30000; // Sub-agents get 30KB (vs 100KB for main agent)
 const MAX_SUBAGENT_CONTEXT_CHARS = 200000; // ~50K tokens — sub-agents have tighter budgets
 
+// Background sub-agent batch tracking
+// Each batch gets a unique ID. When all sub-agents in a batch complete,
+// results are injected into conversationHistory and an event is emitted.
+let nextBatchId = 1;
+const pendingBatches = new Map(); // batchId -> { tasks, userId, channelContext }
+
+// Channel context — set by the contract server before calling chat() so that
+// background sub-agent completions can route results to the correct channel.
+// In a cross-channel binding scenario (Telegram + Slack), this prevents results
+// from being delivered to whichever channel sent the *most recent* message.
+let channelContext = { chatId: null, channel: null, actorId: null };
+
 // ---------------------------------------------------------------------------
-// Sub-agent status tracking — shared state for real-time progress reporting
+// Sub-agent status tracking — per-batch state for real-time progress reporting.
+// Supports multiple concurrent batches without clobbering each other's status.
 // ---------------------------------------------------------------------------
 
-const subagentStatus = {
-  active: false,
-  startedAt: 0,
-  mainTask: "",          // What the main agent asked the sub-agents to do
-  agents: [],            // Per-agent status: { id, toolSet, description, iteration, maxIterations, lastTool, lastToolArg, status }
-};
+const activeBatchStatuses = new Map(); // batchId -> { startedAt, mainTask, agents[] }
 
 /**
  * Get a snapshot of current sub-agent status (safe to read while agents run).
+ * Merges all active batches into a single view for the status reporter.
  */
 function getSubagentStatus() {
-  if (!subagentStatus.active) return null;
-  const elapsed = Math.round((Date.now() - subagentStatus.startedAt) / 1000);
+  if (activeBatchStatuses.size === 0) return null;
+  // Use the earliest startedAt across all active batches
+  let earliest = Infinity;
+  let allAgents = [];
+  let mainTasks = [];
+  for (const [, batch] of activeBatchStatuses) {
+    if (batch.startedAt < earliest) earliest = batch.startedAt;
+    if (batch.mainTask) mainTasks.push(batch.mainTask);
+    allAgents = allAgents.concat(batch.agents.map((a) => ({ ...a })));
+  }
+  const elapsed = Math.round((Date.now() - earliest) / 1000);
   return {
     active: true,
     elapsedSeconds: elapsed,
-    mainTask: subagentStatus.mainTask,
-    agents: subagentStatus.agents.map((a) => ({ ...a })),
+    mainTask: mainTasks.join("; "),
+    agents: allAgents,
   };
 }
+
+// Legacy compat: subagentStatus.active read by some code paths (e.g., status queries)
+const subagentStatus = {
+  get active() { return activeBatchStatuses.size > 0; },
+};
 
 // ---------------------------------------------------------------------------
 // Smart truncation — preserves beginning and end of large outputs so models
@@ -247,7 +278,7 @@ const SYSTEM_PROMPT =
   "- **Scheduling**: Create, list, update, and delete recurring cron schedules via EventBridge\n" +
   "- **Code execution**: Run bash commands, Python scripts, Node.js scripts via exec\n" +
   "- **File reading**: Read local files created by exec (e.g. /tmp/output.csv)\n" +
-  "- **Sub-agents**: Spawn parallel sub-agents for complex multi-step tasks\n\n" +
+  "- **Sub-agents**: Spawn parallel sub-agents for complex multi-step tasks (runs in background, results delivered automatically)\n\n" +
   "NEVER share local filesystem paths (like /root/... or /tmp/...) with users. " +
   "NEVER generate presigned S3 URLs, S3 URIs (s3://...), or any download links. " +
   "The ONLY way to deliver files is [SEND_FILE:filename] in your response text. " +
@@ -491,13 +522,17 @@ const TOOLS = [
       name: "spawn_subagents",
       description:
         "Spawn one or more specialized sub-agents to work on tasks in parallel. " +
+        "IMPORTANT: This tool is ASYNCHRONOUS — sub-agents run in the background " +
+        "and this tool returns immediately. You will NOT receive results right away. " +
+        "Results will be delivered to you automatically when the sub-agents finish. " +
+        "After calling this tool, acknowledge to the user that work is in progress " +
+        "and you'll share results when ready. " +
         "Each sub-agent runs independently with its own Bedrock conversation loop. " +
-        "Use for complex multi-step tasks that benefit from parallel execution. " +
         "Sub-agents have access to: exec, web_fetch, web_search, read_file, and user file tools. " +
         "IMPORTANT: Sub-agents do NOT see USER.md or conversation history — you MUST include " +
         "ALL relevant user preferences, constraints, and filters in each task description " +
         "(e.g. budget, location, land type, language). " +
-        "Results from all sub-agents are combined and returned.",
+        "You can continue chatting with the user while sub-agents work.",
       parameters: {
         type: "object",
         properties: {
@@ -1035,12 +1070,16 @@ async function executeTool(toolName, args, userId) {
 /**
  * Run a single sub-agent: independent Bedrock conversation loop.
  */
-async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet = "general", agentIndex = 0) {
+async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet = "general", agentIndex = 0, batchId = 0) {
   const subTools = TOOLS.filter(
     (t) => toolNames.includes(t.function.name) && t.function.name !== "spawn_subagents", // no recursive spawning
   );
 
   const systemPrompt = buildSubagentSystemPrompt(taskDescription, toolSet);
+
+  // Helper to safely get this agent's status entry from the per-batch tracker.
+  // Returns null if the batch was already cleaned up (e.g., container shutting down).
+  const getAgentStatus = () => activeBatchStatuses.get(batchId)?.agents?.[agentIndex] || null;
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -1051,21 +1090,15 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
   ];
 
   // Update status tracker
-  if (subagentStatus.agents[agentIndex]) {
-    subagentStatus.agents[agentIndex].status = "running";
-  }
+  { const s = getAgentStatus(); if (s) s.status = "running"; }
 
   for (let i = 0; i < MAX_SUBAGENT_ITERATIONS; i++) {
     // Update iteration in status tracker
-    if (subagentStatus.agents[agentIndex]) {
-      subagentStatus.agents[agentIndex].iteration = i + 1;
-    }
+    { const s = getAgentStatus(); if (s) s.iteration = i + 1; }
 
     if (Date.now() > deadline) {
       console.warn(`[subagent] Deadline exceeded at iteration ${i + 1}`);
-      if (subagentStatus.agents[agentIndex]) {
-        subagentStatus.agents[agentIndex].status = "deadline_exceeded";
-      }
+      { const s = getAgentStatus(); if (s) s.status = "deadline_exceeded"; }
       break;
     }
 
@@ -1080,9 +1113,7 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
           await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
           continue;
         }
-        if (subagentStatus.agents[agentIndex]) {
-          subagentStatus.agents[agentIndex].status = "error";
-        }
+        { const s = getAgentStatus(); if (s) s.status = "error"; }
         return `Sub-agent error: ${err.message}`;
       }
       choice = response.choices?.[0];
@@ -1094,9 +1125,7 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
       }
     }
     if (!choice) {
-      if (subagentStatus.agents[agentIndex]) {
-        subagentStatus.agents[agentIndex].status = "error";
-      }
+      { const s = getAgentStatus(); if (s) s.status = "error"; }
       return "Sub-agent received no response after retries";
     }
 
@@ -1105,9 +1134,7 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
 
     const toolCalls = assistantMessage.tool_calls;
     if (!toolCalls || toolCalls.length === 0) {
-      if (subagentStatus.agents[agentIndex]) {
-        subagentStatus.agents[agentIndex].status = "completed";
-      }
+      { const s = getAgentStatus(); if (s) s.status = "completed"; }
       return assistantMessage.content || "(no output from sub-agent)";
     }
 
@@ -1123,13 +1150,16 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
         continue;
       }
       // Update status tracker with current tool
-      if (subagentStatus.agents[agentIndex]) {
-        subagentStatus.agents[agentIndex].lastTool = fnName;
-        subagentStatus.agents[agentIndex].lastToolArg =
-          fnName === "web_fetch" ? (fnArgs.url || "").slice(0, 100) :
-          fnName === "exec" ? (fnArgs.command || "").slice(0, 80) :
-          fnName === "web_search" ? (fnArgs.query || "").slice(0, 80) :
-          "";
+      {
+        const s = getAgentStatus();
+        if (s) {
+          s.lastTool = fnName;
+          s.lastToolArg =
+            fnName === "web_fetch" ? (fnArgs.url || "").slice(0, 100) :
+            fnName === "exec" ? (fnArgs.command || "").slice(0, 80) :
+            fnName === "web_search" ? (fnArgs.query || "").slice(0, 80) :
+            "";
+        }
       }
       console.log(`[subagent] Tool: ${fnName}`);
       const result = await executeTool(fnName, fnArgs, userId);
@@ -1171,14 +1201,20 @@ async function runSubagent(taskDescription, toolNames, userId, deadline, toolSet
       }
     }
   }
-  if (subagentStatus.agents[agentIndex]) {
-    subagentStatus.agents[agentIndex].status = "iteration_limit";
-  }
+  { const s = getAgentStatus(); if (s) s.status = "iteration_limit"; }
   return "Sub-agent reached iteration limit";
 }
 
 /**
- * Spawn multiple sub-agents in parallel (fork-join pattern).
+ * Spawn multiple sub-agents in parallel (ASYNC — non-blocking).
+ *
+ * v55: Instead of blocking with await Promise.allSettled(), this function
+ * starts sub-agents in the background and returns immediately. When all
+ * sub-agents complete, results are injected into conversationHistory and
+ * an event is emitted so the contract server can trigger a new chat() call.
+ *
+ * This means the main agent loop exits quickly (chatBusy = false),
+ * allowing the user to send messages while sub-agents work.
  */
 async function executeSpawnSubagents(args, userId) {
   const tasks = args.tasks || [];
@@ -1187,47 +1223,89 @@ async function executeSpawnSubagents(args, userId) {
     return `Error: Maximum ${MAX_CONCURRENT_SUBAGENTS} concurrent sub-agents`;
   }
 
+  const batchId = nextBatchId++;
   const deadline = Date.now() + 3600000; // 1 hour
-  console.log(`[agent] Spawning ${tasks.length} sub-agent(s)`);
+  console.log(`[agent] Spawning ${tasks.length} sub-agent(s) as background batch #${batchId}`);
 
-  // Initialize sub-agent status tracker
-  subagentStatus.active = true;
-  subagentStatus.startedAt = Date.now();
-  subagentStatus.mainTask = tasks.map((t) => t.description?.slice(0, 100) || "").join("; ");
-  subagentStatus.agents = tasks.map((task, i) => ({
-    id: i + 1,
-    toolSet: task.tool_set || "general",
-    description: (task.description || "").slice(0, 120),
-    iteration: 0,
-    maxIterations: MAX_SUBAGENT_ITERATIONS,
-    lastTool: "",
-    lastToolArg: "",
-    status: "starting",
-  }));
+  // Initialize per-batch status tracker (supports concurrent batches)
+  const batchStatus = {
+    startedAt: Date.now(),
+    mainTask: tasks.map((t) => t.description?.slice(0, 100) || "").join("; "),
+    agents: tasks.map((task, i) => ({
+      id: i + 1,
+      toolSet: task.tool_set || "general",
+      description: (task.description || "").slice(0, 120),
+      iteration: 0,
+      maxIterations: MAX_SUBAGENT_ITERATIONS,
+      lastTool: "",
+      lastToolArg: "",
+      status: "starting",
+    })),
+  };
+  activeBatchStatuses.set(batchId, batchStatus);
 
   const promises = tasks.map((task, i) => {
     const toolSet = task.tool_set || "general";
     const toolNames = SUBAGENT_TOOL_SETS[toolSet] || SUBAGENT_TOOL_SETS.general;
     console.log(`[agent] Sub-agent ${i + 1}: ${toolSet} (${toolNames.length} tools)`);
-    return runSubagent(task.description, toolNames, userId, deadline, toolSet, i);
+    return runSubagent(task.description, toolNames, userId, deadline, toolSet, i, batchId);
   });
 
-  try {
-    const results = await Promise.allSettled(promises);
+  // Capture channel context at spawn time (not at completion time) to prevent
+  // cross-channel delivery bugs when user has Telegram + Slack bound.
+  const batchChannelCtx = { ...channelContext };
 
-    const output = results.map((r, i) => {
-      const status = r.status === "fulfilled" ? "completed" : "failed";
-      const value = r.status === "fulfilled" ? r.value : r.reason?.message || "Unknown error";
-      return `--- Sub-agent ${i + 1} (${status}) ---\n${value}`;
+  // Track this batch
+  pendingBatches.set(batchId, { tasks, userId, channelContext: batchChannelCtx });
+
+  // Fire-and-forget: run sub-agents in background, handle results on completion
+  Promise.allSettled(promises)
+    .then((results) => {
+      const output = results.map((r, i) => {
+        const status = r.status === "fulfilled" ? "completed" : "failed";
+        const value = r.status === "fulfilled" ? r.value : r.reason?.message || "Unknown error";
+        return `--- Sub-agent ${i + 1} (${status}) ---\n${value}`;
+      });
+
+      const combinedResults = output.join("\n\n");
+      console.log(`[agent] Background batch #${batchId} complete (${combinedResults.length} chars)`);
+
+      // Emit event with results payload + channel context captured at spawn time.
+      // The contract server will inject results into conversationHistory within its
+      // chatBusy lock, preventing race conditions with concurrent user messages.
+      agentEvents.emit("subagents-complete", {
+        batchId,
+        userId,
+        results: combinedResults,
+        channelContext: batchChannelCtx,
+      });
+    })
+    .catch((err) => {
+      console.error(`[agent] Background batch #${batchId} error: ${err.message}`);
+      agentEvents.emit("subagents-complete", {
+        batchId,
+        userId,
+        results: "The sub-agents encountered an error: " + err.message,
+        error: err.message,
+        channelContext: batchChannelCtx,
+      });
+    })
+    .finally(() => {
+      // Clean up this batch's status and tracking entry
+      activeBatchStatuses.delete(batchId);
+      pendingBatches.delete(batchId);
     });
 
-    return output.join("\n\n");
-  } finally {
-    // Clear status tracker
-    subagentStatus.active = false;
-    subagentStatus.agents = [];
-    subagentStatus.mainTask = "";
-  }
+  // Return immediately — the main agent loop continues without blocking
+  const taskSummaries = tasks.map((t, i) =>
+    `${i + 1}. ${(t.description || "").slice(0, 100)}`
+  ).join("\n");
+
+  return (
+    `Sub-agents dispatched (batch #${batchId}, ${tasks.length} task(s)). ` +
+    "They are working in the background. Results will be delivered automatically when ready.\n\n" +
+    "Tasks:\n" + taskSummaries
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,6 +1496,8 @@ module.exports = {
   resetHistory,
   setExecEnv,
   getSubagentStatus,
+  agentEvents,
+  channelContext,
   // Exported for testing
   TOOLS,
   SYSTEM_PROMPT,
@@ -1440,6 +1520,8 @@ module.exports = {
   validateUrlSafety,
   validateResolvedIps,
   subagentStatus,
+  activeBatchStatuses,
+  pendingBatches,
   // Constants for testing
   MAX_ITERATIONS,
   MAX_SUBAGENT_ITERATIONS,

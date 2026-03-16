@@ -58,6 +58,7 @@ let initPromise = null;
 let secretsPrefetchPromise = null;
 let currentChannel = null;
 let currentChatId = null;
+let currentActorId = null;
 let startTime = Date.now();
 let shuttingDown = false;
 let credentialRefreshTimer = null;
@@ -398,11 +399,23 @@ const AGENTS_MD_CONTENT = [
   "You can spawn parallel sub-agents for complex multi-step tasks using the `spawn_subagents` tool.",
   "Each sub-agent runs independently with its own Bedrock conversation loop.",
   "",
+  "### IMPORTANT: Sub-agents run ASYNCHRONOUSLY",
+  "",
+  "When you call `spawn_subagents`, the sub-agents start working in the background and the tool",
+  "returns IMMEDIATELY. You will NOT receive results right away. Instead:",
+  "1. Call `spawn_subagents` with the tasks",
+  "2. The tool returns a confirmation that sub-agents are dispatched",
+  "3. Tell the user you're working on it and will share results when ready",
+  "4. You can continue chatting with the user while sub-agents work",
+  "5. When sub-agents finish, their results will be delivered to you automatically",
+  "6. Format and present the results to the user",
+  "",
   "### Rules:",
   "1. ALWAYS acknowledge the user's request within seconds",
   "2. For simple questions/chat → answer directly (no sub-agent needed)",
   "3. For complex tasks → tell the user you're starting the work, then use spawn_subagents to delegate",
-  "4. Sub-agents share your tools: exec, web_fetch, web_search, file tools",
+  "4. After spawning, respond to the user with a brief acknowledgment — do NOT wait for results",
+  "5. Sub-agents share your tools: exec, web_fetch, web_search, file tools",
   "",
   "### Sub-Agent Types:",
   "- **web_scraping**: Puppeteer + Lightpanda + Scrapling for data extraction",
@@ -807,6 +820,167 @@ async function init(userId, actorId, channel) {
 let chatBusy = false;
 const messageQueue = []; // { messageText, actorId, channel, chatId }
 
+// ---------------------------------------------------------------------------
+// Background sub-agent completion handler (v55)
+//
+// When sub-agents finish in the background, custom-agent.js injects results
+// into conversationHistory and emits 'subagents-complete'. We listen for
+// this event and trigger a new processAndDeliver cycle to format/send results.
+// ---------------------------------------------------------------------------
+
+customAgent.agentEvents.on("subagents-complete", (event) => {
+  const { batchId, userId, results, error, channelContext: batchCtx } = event;
+  console.log(`[contract] Sub-agent batch #${batchId} complete${error ? " (with error)" : ""} — triggering result delivery`);
+
+  // Use channel context captured at spawn time (not current module-level state)
+  // to prevent cross-channel delivery bugs when user has Telegram + Slack bound.
+  const deliverChatId = batchCtx?.chatId || currentChatId;
+  const deliverChannel = batchCtx?.channel || currentChannel;
+  const deliverActorId = batchCtx?.actorId || currentActorId;
+
+  // We need channel/chatId to deliver.
+  if (!deliverChatId || !deliverChannel) {
+    console.warn("[contract] No chatId/channel available — cannot deliver sub-agent results");
+    return;
+  }
+
+  if (!deliverActorId) {
+    console.warn("[contract] No actorId available — cannot deliver sub-agent results");
+    return;
+  }
+
+  // If the agent is currently busy processing another message, queue the result delivery.
+  if (chatBusy) {
+    console.log(`[contract] Agent busy — queuing sub-agent result delivery (queue size: ${messageQueue.length})`);
+    messageQueue.push({
+      messageText: results,
+      actorId: deliverActorId,
+      channel: deliverChannel,
+      chatId: deliverChatId,
+      isSubagentResult: true,
+    });
+    return;
+  }
+
+  // Agent is free — process immediately
+  chatBusy = true;
+  processSubagentResults(results, deliverActorId, deliverChannel, deliverChatId)
+    .catch((err) => {
+      console.error(`[contract] Sub-agent result delivery error: ${err.message}`);
+    })
+    .then(() => {
+      if (messageQueue.length > 0) {
+        drainQueue().catch((err) => {
+          console.error(`[contract] drainQueue error: ${err.message}`);
+          chatBusy = false;
+        });
+      } else {
+        chatBusy = false;
+      }
+    });
+});
+
+/**
+ * Process and deliver sub-agent results.
+ * Injects results into conversationHistory (within chatBusy lock to prevent races),
+ * then triggers a chat() call so the LLM can format them, then delivers to channel.
+ */
+async function processSubagentResults(subagentResults, actorId, channel, chatId) {
+  const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+  const isTelegram = channel === "telegram" && TELEGRAM_BOT_TOKEN;
+
+  // --- Streaming draft state (Telegram only) ---
+  const DRAFT_THROTTLE_MS = 300;
+  const DRAFT_MIN_LENGTH = 10;
+  const DRAFT_STARTUP_DELAY_MS = 3000;
+  let lastDraftTime = 0;
+  let streamingActive = false;
+  const draftId = isTelegram ? String(Date.now() * 1000000 + Math.floor(Math.random() * 1000000)) : null;
+  const streamStartTime = Date.now();
+
+  const onDelta = isTelegram
+    ? (accumulatedText) => {
+        const now = Date.now();
+        if (now - streamStartTime < DRAFT_STARTUP_DELAY_MS) return;
+        if (now - lastDraftTime < DRAFT_THROTTLE_MS) return;
+        if (accumulatedText.length < DRAFT_MIN_LENGTH) return;
+        lastDraftTime = now;
+        if (!streamingActive) {
+          console.log(`[contract] Sub-agent result streaming started — draftId=${draftId}`);
+        }
+        streamingActive = true;
+        const cleanDelta = channelSender.extractTextFromContentBlocks(accumulatedText);
+        channelSender.sendTelegramDraft(chatId, cleanDelta, TELEGRAM_BOT_TOKEN, draftId);
+      }
+    : null;
+
+  // Typing indicator
+  let typingTimer = null;
+  if (isTelegram) {
+    channelSender.sendTelegramTyping(chatId, TELEGRAM_BOT_TOKEN);
+    typingTimer = setInterval(() => {
+      channelSender.sendTelegramTyping(chatId, TELEGRAM_BOT_TOKEN);
+    }, 4000);
+  }
+
+  try {
+    // Build a single user message with results + formatting instruction (avoids
+    // pushing two consecutive user messages which wastes context and violates
+    // the alternating user/assistant message protocol).
+    const combinedMessage =
+      "[SUBAGENT_RESULTS]\n" +
+      "The sub-agents you dispatched have finished. Here are their results:\n\n" +
+      subagentResults +
+      "\n\n---\n" +
+      "Present these results to the user in a clear, well-formatted way. " +
+      "Do NOT mention sub-agents, internal processes, or batch numbers.";
+
+    // Now trigger a chat() call. The LLM will see the results and format them
+    // for the user in a single turn.
+    let responseText;
+    try {
+      responseText = await customAgent.chat(
+        combinedMessage,
+        actorId, 0, onDelta,
+      );
+    } catch (agentErr) {
+      responseText = "I'm having trouble formatting the results. Please try again in a moment.";
+      console.error(`[contract] Sub-agent result formatting error: ${agentErr.message}`);
+    }
+
+    console.log(`[contract] Sub-agent result response (${responseText.length} chars): ${responseText.slice(0, 200)}`);
+
+    if (!responseText || !responseText.trim()) {
+      responseText = "The task completed but I couldn't format the results. Please try asking again.";
+    }
+
+    const { files, cleanText } = extractFileMarkers(responseText, currentNamespace);
+
+    console.log(
+      `[contract] Delivering sub-agent results (${cleanText.length} chars, ${files.length} files, streamed=${streamingActive}) to ${channel}:${chatId}`,
+    );
+    await channelSender.deliverResponse(
+      channel, chatId, cleanText, files.length > 0 ? files : null, tokens,
+      streamingActive ? draftId : null,
+    );
+    console.log("[contract] Sub-agent results delivered successfully");
+  } catch (err) {
+    console.error(`[contract] processSubagentResults failed: ${err.message}`);
+    try {
+      await channelSender.deliverResponse(
+        channel, chatId,
+        "I'm sorry, something went wrong while processing the task results. Please try again.",
+        null, tokens,
+        streamingActive ? draftId : null,
+      );
+    } catch (e) {
+      console.error(`[contract] Failed to send error message: ${e.message}`);
+    }
+  } finally {
+    if (typingTimer) clearInterval(typingTimer);
+  }
+}
+
 /**
  * Detect if a message is a status/progress query.
  * These get immediate responses when sub-agents are running.
@@ -872,9 +1046,14 @@ function formatSubagentStatus(status) {
 async function drainQueue() {
   while (messageQueue.length > 0) {
     const next = messageQueue.shift();
-    console.log(`[contract] Processing queued message (${messageQueue.length} remaining, isCron=${!!next.isCron})`);
+    console.log(`[contract] Processing queued message (${messageQueue.length} remaining, isCron=${!!next.isCron}, isSubagentResult=${!!next.isSubagentResult})`);
     try {
-      await processAndDeliver(next.messageText, next.actorId, next.channel, next.chatId, { isCron: !!next.isCron });
+      if (next.isSubagentResult) {
+        // Sub-agent results need to be injected into history and formatted
+        await processSubagentResults(next.messageText, next.actorId, next.channel, next.chatId);
+      } else {
+        await processAndDeliver(next.messageText, next.actorId, next.channel, next.chatId, { isCron: !!next.isCron });
+      }
     } catch (err) {
       console.error(`[contract] Queued processAndDeliver error: ${err.message}`);
     }
@@ -1095,6 +1274,11 @@ const server = http.createServer(async (req, res) => {
           if (chatId) {
             currentChatId = chatId;
             currentChannel = channel;
+            currentActorId = actorId;
+            // Update channel context so background sub-agents capture the originating channel
+            customAgent.channelContext.chatId = chatId;
+            customAgent.channelContext.channel = channel;
+            customAgent.channelContext.actorId = actorId;
           }
 
           // Block until init completes
@@ -1225,6 +1409,11 @@ const server = http.createServer(async (req, res) => {
           if (chatId) {
             currentChatId = chatId;
             currentChannel = channel;
+            currentActorId = actorId;
+            // Update channel context so background sub-agents capture the originating channel
+            customAgent.channelContext.chatId = chatId;
+            customAgent.channelContext.channel = channel;
+            customAgent.channelContext.actorId = actorId;
           }
 
           // Trigger init if not done yet (blocks until proxy is ready)
@@ -1401,6 +1590,24 @@ process.on("SIGTERM", async () => {
   if (credentialRefreshTimer) {
     clearInterval(credentialRefreshTimer);
     credentialRefreshTimer = null;
+  }
+
+  // Notify user about interrupted sub-agent work (best-effort, 3s timeout)
+  if (customAgent.pendingBatches.size > 0 && currentChatId && currentChannel) {
+    console.log(`[contract] ${customAgent.pendingBatches.size} pending sub-agent batch(es) — notifying user`);
+    const tokens = { telegram: TELEGRAM_BOT_TOKEN, slack: SLACK_BOT_TOKEN };
+    try {
+      await Promise.race([
+        channelSender.deliverResponse(
+          currentChannel, currentChatId,
+          "My session is restarting. Any background tasks in progress were interrupted — please re-send your request when I'm back.",
+          null, tokens,
+        ),
+        new Promise((r) => setTimeout(r, 3000)),
+      ]);
+    } catch (err) {
+      console.warn(`[contract] Failed to notify user about interrupted tasks: ${err.message}`);
+    }
   }
 
   // Save workspace to S3 (10s max)

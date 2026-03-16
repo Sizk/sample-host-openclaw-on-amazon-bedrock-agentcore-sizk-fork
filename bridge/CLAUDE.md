@@ -206,6 +206,20 @@ Then: `write_user_file` with `filename='chart.png'` and `file_path='/tmp/chart.p
 
 Use `spawn_subagents` to run parallel sub-agents for complex multi-step tasks. Each sub-agent runs independently with its own Bedrock conversation loop.
 
+### IMPORTANT: Sub-agents are ASYNCHRONOUS
+
+When you call `spawn_subagents`, the sub-agents start in the **background** and the tool returns
+**immediately**. You will NOT receive results right away. The flow is:
+
+1. Call `spawn_subagents` with the tasks
+2. The tool returns a confirmation that sub-agents are dispatched
+3. **Tell the user you're working on it** — give a brief, friendly acknowledgment
+4. **You can continue chatting** with the user while sub-agents work
+5. When sub-agents finish, their results appear as a new message in the conversation
+6. **Format and present** the results to the user clearly
+
+**DO NOT** try to wait for results or check status in a loop. Results arrive automatically.
+
 ### Sub-Agent Types
 
 | Type | Use for |
