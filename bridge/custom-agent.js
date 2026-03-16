@@ -1390,7 +1390,11 @@ async function chat(userMessage, actorId, deadlineMs = 0, onDelta = null) {
   }
 
   console.warn("[agent] Max iterations reached");
-  return "I ran into a processing limit. Please try rephrasing your request.";
+  // Return partial content if available, otherwise a friendly fallback
+  if (lastAssistantText && lastAssistantText.length > 20) {
+    return lastAssistantText;
+  }
+  return "Sorry, this task was too complex to complete in one go. Try breaking it into smaller steps or asking again with a simpler request.";
 }
 
 // ---------------------------------------------------------------------------
