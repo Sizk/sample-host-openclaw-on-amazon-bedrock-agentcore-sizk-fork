@@ -468,6 +468,11 @@ const WORKSPACE_FILES = [
     label: "Notes & Memories",
     purpose: "freeform notes and memories",
   },
+  {
+    filename: "TASKS.md",
+    label: "Task Templates Index",
+    purpose: "index of reusable task templates with output formats and filters",
+  },
 ];
 const WORKSPACE_PER_FILE_MAX_CHARS = 4096;
 const WORKSPACE_TOTAL_MAX_CHARS = 20000;
@@ -599,7 +604,7 @@ describe("buildUserIdentityContext structure (sync subset)", () => {
   });
 });
 
-describe("Workspace: all 6 files present", () => {
+describe("Workspace: all 7 files present", () => {
   it("renders all workspace file sections", () => {
     const contents = {
       "AGENTS.md": "# Rules\nBe helpful",
@@ -608,6 +613,7 @@ describe("Workspace: all 6 files present", () => {
       "IDENTITY.md": "# Identity\nClaw Bot",
       "TOOLS.md": "# Tools\nUse S3 skill",
       "MEMORY.md": "# Notes\nRemember birthdays",
+      "TASKS.md": "# Task Templates\n| Task | File | Description |",
     };
     const result = buildIdentityText(
       "telegram:123456789",
@@ -620,12 +626,14 @@ describe("Workspace: all 6 files present", () => {
     assert.ok(result.includes("Workspace: Agent Identity (IDENTITY.md)"));
     assert.ok(result.includes("Workspace: Tools Documentation (TOOLS.md)"));
     assert.ok(result.includes("Workspace: Notes & Memories (MEMORY.md)"));
+    assert.ok(result.includes("Workspace: Task Templates Index (TASKS.md)"));
     assert.ok(result.includes("Be helpful"));
     assert.ok(result.includes("Friendly tone"));
     assert.ok(result.includes("Prefers English"));
     assert.ok(result.includes("Claw Bot"));
     assert.ok(result.includes("Use S3 skill"));
     assert.ok(result.includes("Remember birthdays"));
+    assert.ok(result.includes("Task Templates"));
     // All should show pre-loaded in guide
     assert.ok(!result.includes("*Not yet created.*"));
   });
@@ -636,10 +644,10 @@ describe("Workspace: all files missing", () => {
     const result = buildIdentityText("telegram:123456789", "telegram", {});
     const notCreatedCount = (result.match(/\*Not yet created\.\*/g) || [])
       .length;
-    assert.equal(notCreatedCount, 6);
+    assert.equal(notCreatedCount, 7);
     // Guide should show all empty
     const emptyCount = (result.match(/\| empty \|/g) || []).length;
-    assert.equal(emptyCount, 6);
+    assert.equal(emptyCount, 7);
   });
 });
 
@@ -657,6 +665,7 @@ describe("Workspace: mixed present and missing", () => {
     assert.ok(result.includes("This user has no USER.md"));
     assert.ok(result.includes("This user has no TOOLS.md"));
     assert.ok(result.includes("This user has no MEMORY.md"));
+    assert.ok(result.includes("This user has no TASKS.md"));
   });
 });
 
@@ -704,8 +713,8 @@ describe("Workspace: sanitization", () => {
 
 describe("Workspace: total cap enforcement", () => {
   it("skips lower-priority files when total cap exceeded", () => {
-    // Each file at 4096 chars: 6 * 4096 = 24576 > 20000
-    // The last two files (TOOLS.md, MEMORY.md) should be skipped
+    // Each file at 4096 chars: 7 * 4096 = 28672 > 20000
+    // The last three files (TOOLS.md, MEMORY.md, TASKS.md) should be skipped
     const bigContent = "y".repeat(4096);
     const contents = {
       "AGENTS.md": bigContent,
@@ -714,19 +723,23 @@ describe("Workspace: total cap enforcement", () => {
       "IDENTITY.md": bigContent,
       "TOOLS.md": bigContent,
       "MEMORY.md": bigContent,
+      "TASKS.md": bigContent,
     };
     const result = buildIdentityText(
       "telegram:123456789",
       "telegram",
       contents,
     );
-    // TOOLS.md and MEMORY.md should have the skip marker
+    // TOOLS.md, MEMORY.md, and TASKS.md should have the skip marker
     assert.ok(result.includes("*Skipped — total workspace size cap reached.*"));
     assert.ok(
       result.includes('read_user_file("telegram_123456789", "TOOLS.md")'),
     );
     assert.ok(
       result.includes('read_user_file("telegram_123456789", "MEMORY.md")'),
+    );
+    assert.ok(
+      result.includes('read_user_file("telegram_123456789", "TASKS.md")'),
     );
     // Higher-priority files should still be present
     assert.ok(result.includes("Workspace: Operating Instructions (AGENTS.md)"));
@@ -742,11 +755,16 @@ describe("Workspace: total cap enforcement", () => {
         "| MEMORY.md | freeform notes and memories | skipped (cap) |",
       ),
     );
+    assert.ok(
+      result.includes(
+        "| TASKS.md | index of reusable task templates with output formats and filters | skipped (cap) |",
+      ),
+    );
   });
 });
 
 describe("Workspace: section ordering", () => {
-  it("preserves priority order AGENTS > SOUL > USER > IDENTITY > TOOLS > MEMORY", () => {
+  it("preserves priority order AGENTS > SOUL > USER > IDENTITY > TOOLS > MEMORY > TASKS", () => {
     const contents = {
       "AGENTS.md": "agents-content",
       "SOUL.md": "soul-content",
@@ -754,6 +772,7 @@ describe("Workspace: section ordering", () => {
       "IDENTITY.md": "identity-content",
       "TOOLS.md": "tools-content",
       "MEMORY.md": "memory-content",
+      "TASKS.md": "tasks-content",
     };
     const result = buildIdentityText(
       "telegram:123456789",
@@ -766,10 +785,12 @@ describe("Workspace: section ordering", () => {
     const identityPos = result.indexOf("Agent Identity");
     const toolsPos = result.indexOf("Tools Documentation");
     const memoryPos = result.indexOf("Notes & Memories");
+    const tasksPos = result.indexOf("Task Templates Index");
     assert.ok(agentsPos < soulPos, "AGENTS before SOUL");
     assert.ok(soulPos < userPos, "SOUL before USER");
     assert.ok(userPos < identityPos, "USER before IDENTITY");
     assert.ok(identityPos < toolsPos, "IDENTITY before TOOLS");
     assert.ok(toolsPos < memoryPos, "TOOLS before MEMORY");
+    assert.ok(memoryPos < tasksPos, "MEMORY before TASKS");
   });
 });

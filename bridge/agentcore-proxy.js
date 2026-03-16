@@ -601,6 +601,11 @@ const WORKSPACE_FILES = [
     label: "Notes & Memories",
     purpose: "freeform notes and memories",
   },
+  {
+    filename: "TASKS.md",
+    label: "Task Templates Index",
+    purpose: "index of reusable task templates with output formats and filters",
+  },
 ];
 const WORKSPACE_PER_FILE_MAX_CHARS = 4096;
 const WORKSPACE_TOTAL_MAX_CHARS = 20000;
@@ -673,6 +678,12 @@ const WORKSPACE_DEFAULTS = {
     "# Notes & Memories\n\n" +
     "No notes yet. When the user asks you to remember something, " +
     "save it here.\n",
+  "TASKS.md":
+    "# Task Templates\n\n" +
+    "No task templates yet. When the user defines a recurring task with specific output format,\n" +
+    "filters, or sources, create an individual task file (e.g. task_terrenos.md) and add it here.\n\n" +
+    "| Task | File | Description |\n" +
+    "|------|------|-------------|\n",
 };
 
 /**

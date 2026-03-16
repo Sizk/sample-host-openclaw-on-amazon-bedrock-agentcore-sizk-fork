@@ -106,7 +106,11 @@ const SUBAGENT_CONTEXT_BASE =
   "- Prefer structured JSON output from scripts over raw text dumps.\n" +
   "- Batch operations: process multiple items in ONE exec call, not one per call.\n" +
   "- If a command produces too much output, pipe through `head -n 100` or filter with grep.\n" +
-  "- You have max 15 iterations — plan your approach to finish within 8-10 tool calls.\n";
+  "- You have max 15 iterations — plan your approach to finish within 8-10 tool calls.\n\n" +
+  "## Output Format\n\n" +
+  "If your task description includes an OUTPUT FORMAT or TEMPLATE section, follow it STRICTLY.\n" +
+  "Use the exact structure, fields, and ordering specified. Do not improvise the format.\n" +
+  "Every listing/item MUST include all fields requested in the template (especially links).\n";
 
 const SUBAGENT_CONTEXT_SCRAPING =
   "\n## Web Scraping — Scrapling (Python, primary) + Puppeteer (fallback)\n\n" +

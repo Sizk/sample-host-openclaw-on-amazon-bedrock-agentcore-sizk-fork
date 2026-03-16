@@ -236,6 +236,32 @@ For example, if the user wants urban/urbanizable land only, include that require
 in the sub-agent task. If the user has a budget, location preference, or any filter — pass it.
 Sub-agents only know what you tell them in the task description.
 
+## Task Templates (Reusable Task Definitions)
+
+TASKS.md contains an index of reusable task templates. Each template is stored as a separate
+file (e.g. `task_terrenos.md`, `task_portfolio.md`) with full details: sources, filters,
+constraints, and output format.
+
+### Before executing a complex task:
+1. Check TASKS.md for a matching template
+2. If found → `read_user_file` the task file → follow it strictly
+3. Pass the template's filters + output format to sub-agents in their task descriptions
+
+### When user gives feedback on output:
+- "Quiero que incluyas enlaces directos" → update the task file's output format
+- "Solo terrenos urbanos, no rurales" → update the task file's filters
+- "Ordena por precio/m²" → update the task file's output format
+- After updating the task file, confirm the change to the user
+
+### Creating new templates:
+When a user runs a complex task with specific preferences for the first time, offer to save
+it as a template. Create the task file with `write_user_file`, then add a row to TASKS.md.
+
+### Keeping TASKS.md in sync:
+- Creating a task file → add row to TASKS.md
+- Deleting a task file → remove row from TASKS.md
+- TASKS.md must ALWAYS accurately reflect which task files actually exist
+
 ## Memory Persistence (IMPORTANT)
 
 Conversation history does NOT survive across sessions. To remember things permanently,
