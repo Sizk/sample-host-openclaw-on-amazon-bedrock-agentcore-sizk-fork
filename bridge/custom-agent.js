@@ -114,6 +114,11 @@ const SUBAGENT_CONTEXT_SCRAPING =
   "**NEVER dump entire pages, `body.innerText`, or full HTML** — extract ONLY the specific data you need.\n" +
   "**ALWAYS use targeted CSS selectors or XPath** to extract structured data.\n" +
   "Output compact JSON. Batch multiple URLs in ONE script call.\n\n" +
+  "### CRITICAL: Always extract REAL links\n\n" +
+  "**ALWAYS extract the actual URL/href for each individual listing item.** " +
+  "NEVER construct or guess URLs from location names or item titles. " +
+  "Every listing result MUST include the real link extracted from the page's HTML (via `::attr(href)` or `.get('href')`). " +
+  "If a link is relative (e.g. `/venta/terrenos-gamiz_fika/12345678/`), prepend the site's base URL.\n\n" +
   "### Tier 1: Scrapling Fetcher (PREFERRED — fast, 100-1500ms)\n" +
   "Use for MOST sites. HTTP request with Chrome TLS fingerprint impersonation.\n" +
   "Works on: Fotocasa, pisos.com, Milanuncios, Investing.com, tech news, Amazon ES, Wallapop, CoinGecko.\n" +
@@ -123,9 +128,11 @@ const SUBAGENT_CONTEXT_SCRAPING =
   "page = Fetcher.get('https://example.com', impersonate='chrome', stealthy_headers=True, follow_redirects=True)\n" +
   "items = page.css('article').getall()           # CSS selector\n" +
   "titles = page.css('h2 a::text').getall()       # extract text\n" +
-  "links = page.css('h2 a::attr(href)').getall()  # extract attributes\n" +
-  "# Structured extraction\n" +
-  "data = [{'title': el.css('h2::text').get(), 'price': el.css('.price::text').get()}\n" +
+  "links = page.css('h2 a::attr(href)').getall()  # extract attributes (ALWAYS extract these!)\n" +
+  "# Structured extraction — ALWAYS include the real link\n" +
+  "base = 'https://example.com'\n" +
+  "data = [{'title': el.css('h2::text').get(), 'price': el.css('.price::text').get(),\n" +
+  "         'link': base + el.css('a::attr(href)').get('')}  # real individual listing URL\n" +
   "        for el in page.css('article')]\n" +
   "import json; print(json.dumps([d for d in data if d.get('title')], ensure_ascii=False))\n" +
   "```\n\n" +

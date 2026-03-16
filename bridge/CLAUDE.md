@@ -36,6 +36,11 @@ All tools are available immediately on startup (~5 second cold start):
 Scrapling (Python) is the PRIMARY scraping tool. It handles TLS fingerprint impersonation,
 anti-bot bypass, and full browser automation. Lightpanda + Puppeteer is available as a fallback.
 
+**CRITICAL: Always extract REAL links.** When scraping listings (real estate, products, articles, etc.),
+ALWAYS extract the actual URL/href for each individual item from the page HTML.
+NEVER construct or guess URLs from location names or item titles.
+If a link is relative, prepend the site's base URL.
+
 ### 1. Scrapling Fetcher (PREFERRED — fast, 100-1500ms)
 Use for MOST sites. HTTP request with Chrome TLS fingerprint impersonation.
 Works on: Fotocasa, pisos.com, Milanuncios, Investing.com, tech news, Amazon ES, Wallapop, CoinGecko.
@@ -44,9 +49,11 @@ from scrapling.fetchers import Fetcher
 page = Fetcher.get('https://example.com', impersonate='chrome', stealthy_headers=True, follow_redirects=True)
 items = page.css('article').getall()           # CSS selector
 titles = page.css('h2 a::text').getall()       # extract text
-links = page.css('h2 a::attr(href)').getall()  # extract attributes
-# Structured extraction
-data = [{'title': el.css('h2::text').get(), 'price': el.css('.price::text').get()}
+links = page.css('h2 a::attr(href)').getall()  # extract actual listing URLs (ALWAYS extract these!)
+# Structured extraction — ALWAYS include the real link
+base = 'https://example.com'
+data = [{'title': el.css('h2::text').get(), 'price': el.css('.price::text').get(),
+         'link': base + el.css('a::attr(href)').get('')}  # real individual listing URL
         for el in page.css('article')]
 import json; print(json.dumps([d for d in data if d.get('title')], ensure_ascii=False))
 ```
