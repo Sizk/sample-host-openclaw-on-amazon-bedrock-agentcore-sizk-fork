@@ -534,9 +534,13 @@ async function deliverResponse(channel, chatId, text, files, tokens, draftId) {
     // text fallback, so it ALWAYS succeeds. The streaming draft will auto-disappear
     // when the real message arrives.
     if (draftId) {
-      // Clear the streaming draft by sending an empty-ish draft before the real message.
-      // This prevents a brief moment where both draft and message are visible.
-      await sendTelegramDraft(chatId, "...", token, draftId);
+      // Clear the streaming draft by sending a whitespace-only draft before the real message.
+      // Using a single space (not "...") to avoid showing visible text in the draft.
+      // The draft uses the same draftId, so it replaces the streaming content.
+      await sendTelegramDraft(chatId, " ", token, draftId);
+      // Wait for Telegram to process the draft update before sending the permanent
+      // message — prevents the user seeing both draft and sendMessage simultaneously.
+      await new Promise((r) => setTimeout(r, 800));
     }
 
     if (cleanText.length <= 4096) {
