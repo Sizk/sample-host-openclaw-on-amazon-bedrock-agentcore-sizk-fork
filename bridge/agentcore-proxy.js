@@ -46,6 +46,16 @@ const SYSTEM_PROMPT =
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 500;
 
+// Cached Bedrock Runtime client (reuse TCP connections across calls)
+let _bedrockRuntimeClient = null;
+function getBedrockRuntimeClient() {
+  if (!_bedrockRuntimeClient) {
+    const { BedrockRuntimeClient } = require("@aws-sdk/client-bedrock-runtime");
+    _bedrockRuntimeClient = new BedrockRuntimeClient({ region: AWS_REGION });
+  }
+  return _bedrockRuntimeClient;
+}
+
 // Session tracking (in-memory, per container instance)
 const sessionMap = new Map();
 
@@ -1178,7 +1188,7 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     BedrockRuntimeClient,
     ConverseCommand,
   } = require("@aws-sdk/client-bedrock-runtime");
-  const client = new BedrockRuntimeClient({ region: AWS_REGION });
+  const client = getBedrockRuntimeClient();
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
   const modelId = resolveModelId(requestedModel);
@@ -1264,7 +1274,7 @@ async function invokeBedrockStreaming(
     BedrockRuntimeClient,
     ConverseStreamCommand,
   } = require("@aws-sdk/client-bedrock-runtime");
-  const client = new BedrockRuntimeClient({ region: AWS_REGION });
+  const client = getBedrockRuntimeClient();
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
   const modelId = resolveModelId(model);
@@ -1305,7 +1315,15 @@ async function invokeBedrockStreaming(
 
       const response = await client.send(new ConverseStreamCommand(params));
 
-      // Write SSE headers
+      // Write SSE headers (only if not already sent from a failed previous attempt)
+      if (res.headersSent) {
+        // Previous attempt partially streamed — response is in a broken state.
+        // Send an error event and end the response; cannot retry cleanly.
+        res.write(`data: ${JSON.stringify({ error: { message: "Stream interrupted, retrying failed" } })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return "";
+      }
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -1659,25 +1677,31 @@ const server = http.createServer(async (req, res) => {
         }
 
         // --- Retrieve memory context for this user ---
-        const lastUserMsg = [...messages]
-          .reverse()
-          .find((m) => m.role === "user");
-        const lastUserText = lastUserMsg
-          ? typeof lastUserMsg.content === "string"
-            ? lastUserMsg.content
-            : JSON.stringify(lastUserMsg.content)
-          : "";
-        const memoryContext = await retrieveMemoryContext(
-          actorId,
-          lastUserText,
-        );
+        // Skip expensive S3 reads for subagent requests — they already have
+        // a custom system prompt and don't need workspace files or memory.
+        let memoryContext = "";
+        let identityContext = "";
+        if (!isSubagent) {
+          const lastUserMsg = [...messages]
+            .reverse()
+            .find((m) => m.role === "user");
+          const lastUserText = lastUserMsg
+            ? typeof lastUserMsg.content === "string"
+              ? lastUserMsg.content
+              : JSON.stringify(lastUserMsg.content)
+            : "";
+          memoryContext = await retrieveMemoryContext(
+            actorId,
+            lastUserText,
+          );
 
-        // Build augmented system text with user identity + memory context.
-        // Identity is ALWAYS injected; memory context may be empty string.
-        const identityContext = await buildUserIdentityContext(
-          actorId,
-          channel,
-        );
+          // Build augmented system text with user identity + memory context.
+          // Identity is ALWAYS injected; memory context may be empty string.
+          identityContext = await buildUserIdentityContext(
+            actorId,
+            channel,
+          );
+        }
         const systemMessages = messages.filter((m) => m.role === "system");
         const baseSystemText =
           systemMessages.length > 0

@@ -235,7 +235,7 @@ function writeCredentialFiles(creds, dir) {
   const configContent = [
     "[default]",
     `credential_process = /bin/cat "${credsPath}"`,
-    `region = ${process.env.AWS_REGION || "us-west-2"}`,
+    `region = ${process.env.AWS_REGION || "eu-west-1"}`,
     "",
   ].join("\n");
 

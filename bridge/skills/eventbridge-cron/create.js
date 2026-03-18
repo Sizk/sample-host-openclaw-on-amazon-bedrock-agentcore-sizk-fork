@@ -3,7 +3,7 @@
  * create_schedule — Create a new EventBridge cron schedule.
  * Usage: node create.js <user_id> <cron_expression> <timezone> <message> [channel] [channel_target] [schedule_name]
  */
-const { SchedulerClient, CreateScheduleCommand } = require("@aws-sdk/client-scheduler");
+const { SchedulerClient, CreateScheduleCommand, DeleteScheduleCommand } = require("@aws-sdk/client-scheduler");
 const {
   REGION,
   SCHEDULE_GROUP,
@@ -57,21 +57,6 @@ async function main() {
   // Generate schedule ID and name
   const scheduleId = generateScheduleId();
   const ebScheduleName = buildScheduleName(userId, scheduleId);
-
-  // Build the target input payload for the cron Lambda
-  const targetInput = JSON.stringify({
-    userId: userId.replace(/_/g, ":").replace(/^(telegram|slack|discord|whatsapp):/, (match) => {
-      // Reconstruct the proper userId format (user_xxx from DynamoDB)
-      // The Lambda will look up the real userId from the actorId
-      return match;
-    }),
-    actorId,
-    channel,
-    channelTarget,
-    message,
-    scheduleId,
-    scheduleName: scheduleName || `Schedule ${scheduleId}`,
-  });
 
   // We need the real userId from DynamoDB. The cron Lambda uses actorId to
   // resolve the user. But we also need the DynamoDB userId for the session
@@ -149,7 +134,19 @@ async function main() {
       updatedAt: now,
     });
   } catch (err) {
+    // Rollback: delete the EventBridge schedule since DynamoDB record failed
     console.error(`Warning: Schedule created in EventBridge but DynamoDB save failed: ${err.message}`);
+    try {
+      await schedulerClient.send(new DeleteScheduleCommand({
+        Name: ebScheduleName,
+        GroupName: SCHEDULE_GROUP,
+      }));
+      console.error("Rolled back EventBridge schedule after DynamoDB failure.");
+      console.error(`Error: Failed to save schedule metadata — schedule creation rolled back.`);
+      process.exit(1);
+    } catch (rollbackErr) {
+      console.error(`Warning: Rollback also failed: ${rollbackErr.message}. Orphaned schedule: ${ebScheduleName}`);
+    }
   }
 
   console.log(`Schedule created successfully!`);

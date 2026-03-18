@@ -123,7 +123,7 @@ async function main() {
       ScheduleExpression: updates.expression || currentSchedule.ScheduleExpression,
       ScheduleExpressionTimezone: updates.timezone || currentSchedule.ScheduleExpressionTimezone,
       FlexibleTimeWindow: { Mode: "OFF" },
-      State: updates.enabled === false ? "DISABLED" : "ENABLED",
+      State: updates.enabled === false ? "DISABLED" : (updates.enabled === true ? "ENABLED" : (currentSchedule.State || "ENABLED")),
       Target: {
         Arn: CRON_LAMBDA_ARN,
         RoleArn: EVENTBRIDGE_ROLE_ARN,

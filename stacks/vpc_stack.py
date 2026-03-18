@@ -86,6 +86,7 @@ class VpcStack(Stack):
             # NOTE: bedrock-agentcore-runtime VPC endpoint service does not exist
             # in ap-southeast-2 yet. Re-add when the service becomes available.
             "Ssm": ec2.InterfaceVpcEndpointAwsService.SSM,
+            "Sts": ec2.InterfaceVpcEndpointAwsService.STS,
             "EcrApi": ec2.InterfaceVpcEndpointAwsService.ECR,
             "EcrDkr": ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
             "SecretsManager": ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
@@ -106,6 +107,13 @@ class VpcStack(Stack):
         self.vpc.add_gateway_endpoint(
             "S3Endpoint",
             service=ec2.GatewayVpcEndpointAwsService.S3,
+            subnets=[private_subnets],
+        )
+
+        # DynamoDB gateway endpoint (free, no SG needed)
+        self.vpc.add_gateway_endpoint(
+            "DynamoDBEndpoint",
+            service=ec2.GatewayVpcEndpointAwsService.DYNAMODB,
             subnets=[private_subnets],
         )
 

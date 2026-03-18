@@ -582,7 +582,7 @@ const TOOL_ENV = {
   HOME: process.env.HOME || "/root",
   NODE_PATH: process.env.NODE_PATH || "/app/node_modules",
   NODE_OPTIONS: process.env.NODE_OPTIONS || "",
-  AWS_REGION: process.env.AWS_REGION || "us-west-2",
+  AWS_REGION: process.env.AWS_REGION || "eu-west-1",
   S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
   EVENTBRIDGE_SCHEDULE_GROUP: process.env.EVENTBRIDGE_SCHEDULE_GROUP || "",
   CRON_LAMBDA_ARN: process.env.CRON_LAMBDA_ARN || "",
@@ -633,16 +633,40 @@ function estimateHistorySize() {
 /**
  * Trim conversation history to stay within context limits.
  * Keeps: system prompt (index 0) + most recent messages.
- * Removes: oldest user/assistant/tool pairs after system prompt.
+ * Removes complete turns (assistant + all following tool messages, or a single
+ * user message) after the system prompt to avoid orphaning tool result messages
+ * that reference deleted tool_call_ids — which would break the Bedrock API.
  */
 function trimHistory() {
   while (
     conversationHistory.length > MIN_KEEP_MESSAGES &&
     estimateHistorySize() > MAX_CONTEXT_CHARS
   ) {
-    // Remove the message right after system prompt (index 1)
-    conversationHistory.splice(1, 1);
-    console.log(`[agent] Trimmed history — now ${conversationHistory.length} messages, ~${estimateHistorySize()} chars`);
+    // Find the extent of the oldest turn starting at index 1 (right after system prompt).
+    // A "turn" is either:
+    //   - A user message (single message)
+    //   - An assistant message + all consecutive tool messages that follow it
+    const startIdx = 1;
+    if (startIdx >= conversationHistory.length) break;
+
+    const firstMsg = conversationHistory[startIdx];
+    let endIdx = startIdx; // inclusive end of the turn to remove
+
+    if (firstMsg.role === "assistant" && firstMsg.tool_calls && firstMsg.tool_calls.length > 0) {
+      // Assistant with tool calls: remove it + all following tool role messages
+      endIdx = startIdx;
+      while (
+        endIdx + 1 < conversationHistory.length &&
+        conversationHistory[endIdx + 1].role === "tool"
+      ) {
+        endIdx++;
+      }
+    }
+    // For user messages or assistant without tool_calls: remove just the single message
+
+    const removeCount = endIdx - startIdx + 1;
+    conversationHistory.splice(startIdx, removeCount);
+    console.log(`[agent] Trimmed ${removeCount} message(s) from history — now ${conversationHistory.length} messages, ~${estimateHistorySize()} chars`);
   }
 }
 
@@ -812,10 +836,18 @@ function executeWriteUserFile(args, userId) {
   // If file_path is specified, use --file flag
   if (args.file_path) {
     return new Promise((resolve) => {
+      // Validate file_path — same allowed paths as executeReadFile
+      const pathMod = require("path");
+      const normalizedFilePath = pathMod.resolve(args.file_path);
+      const allowedPrefixes = ["/tmp", "/root", "/app", "/skills"];
+      if (!allowedPrefixes.some((prefix) => normalizedFilePath.startsWith(prefix))) {
+        resolve("Error: Access denied — can only read files under /tmp, /root, /app, /skills");
+        return;
+      }
       execFile(
         "node",
         [SCRIPT_MAP.write_user_file, userId, args.filename || "", `--file=${args.file_path}`],
-        { env: TOOL_ENV, timeout: TOOL_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
+        { env: execEnv, timeout: TOOL_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
         (error, stdout, stderr) => {
           if (error) {
             resolve(`Error: ${stderr?.trim() || error.message}`);
@@ -833,7 +865,7 @@ function executeWriteUserFile(args, userId) {
     const child = spawn(
       "node",
       [SCRIPT_MAP.write_user_file, userId, args.filename || "", "--stdin"],
-      { env: TOOL_ENV, stdio: ["pipe", "pipe", "pipe"], timeout: TOOL_TIMEOUT_MS },
+      { env: execEnv, stdio: ["pipe", "pipe", "pipe"], timeout: TOOL_TIMEOUT_MS },
     );
     let stdout = "";
     let stderr = "";
@@ -1013,7 +1045,7 @@ function executeSkillScript(toolName, args, userId) {
   if (!scriptArgs) return Promise.resolve(`Error: Unknown tool '${toolName}'`);
   return new Promise((resolve) => {
     execFile("node", scriptArgs, {
-      timeout: TOOL_TIMEOUT_MS, maxBuffer: 1024 * 1024, env: TOOL_ENV,
+      timeout: TOOL_TIMEOUT_MS, maxBuffer: 1024 * 1024, env: execEnv,
     }, (error, stdout, stderr) => {
       if (error) {
         resolve(`Error: ${stderr?.trim() || error.message}`);

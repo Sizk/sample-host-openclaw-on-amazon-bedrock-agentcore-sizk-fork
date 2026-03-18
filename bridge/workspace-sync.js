@@ -131,6 +131,7 @@ async function restoreWorkspace(namespace) {
 
   let totalFiles = 0;
   let continuationToken;
+  const downloadTasks = [];
 
   do {
     const params = {
@@ -163,7 +164,21 @@ async function restoreWorkspace(namespace) {
         continue;
       }
 
-      try {
+      // Download files in parallel batches of 10 for faster restore
+      downloadTasks.push({ obj, relativePath, localFile, localDir });
+    }
+
+    continuationToken = response.IsTruncated
+      ? response.NextContinuationToken
+      : undefined;
+  } while (continuationToken);
+
+  // Download files in parallel batches of 10 for faster restore
+  const BATCH_SIZE = 10;
+  for (let i = 0; i < downloadTasks.length; i += BATCH_SIZE) {
+    const batch = downloadTasks.slice(i, i + BATCH_SIZE);
+    const results = await Promise.allSettled(
+      batch.map(async ({ obj, relativePath, localFile, localDir }) => {
         fs.mkdirSync(localDir, { recursive: true });
         const getResp = await s3.send(
           new (getS3Sdk().GetObjectCommand)({ Bucket: BUCKET, Key: obj.Key }),
@@ -173,18 +188,19 @@ async function restoreWorkspace(namespace) {
           chunks.push(chunk);
         }
         fs.writeFileSync(localFile, Buffer.concat(chunks));
+        return relativePath;
+      }),
+    );
+    for (const result of results) {
+      if (result.status === "fulfilled") {
         totalFiles++;
-      } catch (err) {
+      } else {
         console.warn(
-          `[workspace-sync] Failed to restore ${relativePath}: ${err.message}`,
+          `[workspace-sync] Failed to restore file: ${result.reason?.message || result.reason}`,
         );
       }
     }
-
-    continuationToken = response.IsTruncated
-      ? response.NextContinuationToken
-      : undefined;
-  } while (continuationToken);
+  }
 
   console.log(
     `[workspace-sync] Restored ${totalFiles} file(s) to ${LOCAL_PATH}`,
@@ -207,7 +223,10 @@ function walkDir(dir, root = dir) {
       }
     }
   } catch (err) {
-    // Directory may not exist yet
+    // ENOENT is expected when directory doesn't exist yet; other errors are logged
+    if (err.code !== "ENOENT") {
+      console.warn(`[workspace-sync] walkDir error: ${err.message}`);
+    }
   }
   return results;
 }
@@ -265,6 +284,7 @@ async function saveWorkspace(namespace) {
 
 // Periodic save state
 let _saveInterval = null;
+let _saveInProgress = false;
 
 /**
  * Start periodic workspace saves.
@@ -275,10 +295,16 @@ function startPeriodicSave(namespace, intervalMs) {
     parseInt(process.env.WORKSPACE_SYNC_INTERVAL_MS || "300000", 10);
   if (_saveInterval) clearInterval(_saveInterval);
 
-  _saveInterval = setInterval(() => {
-    saveWorkspace(namespace).catch((err) => {
+  _saveInterval = setInterval(async () => {
+    if (_saveInProgress) return; // Skip if a save is already running
+    _saveInProgress = true;
+    try {
+      await saveWorkspace(namespace);
+    } catch (err) {
       console.warn(`[workspace-sync] Periodic save failed: ${err.message}`);
-    });
+    } finally {
+      _saveInProgress = false;
+    }
   }, interval);
 
   console.log(
@@ -288,11 +314,17 @@ function startPeriodicSave(namespace, intervalMs) {
 
 /**
  * Stop periodic saves and do a final save.
+ * Waits for any in-flight save to complete before the final save.
  */
 async function cleanup(namespace) {
   if (_saveInterval) {
     clearInterval(_saveInterval);
     _saveInterval = null;
+  }
+  // Wait for any in-flight periodic save to finish (poll briefly)
+  const waitStart = Date.now();
+  while (_saveInProgress && Date.now() - waitStart < 3000) {
+    await new Promise((r) => setTimeout(r, 100));
   }
   if (namespace) {
     console.log("[workspace-sync] Final save before shutdown...");

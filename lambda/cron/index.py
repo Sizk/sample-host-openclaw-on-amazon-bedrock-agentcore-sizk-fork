@@ -28,7 +28,7 @@ AGENTCORE_QUALIFIER = os.environ["AGENTCORE_QUALIFIER"]
 IDENTITY_TABLE_NAME = os.environ["IDENTITY_TABLE_NAME"]
 TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
-AWS_REGION = os.environ.get("AWS_REGION", "us-west-2")
+AWS_REGION = os.environ.get("AWS_REGION", "eu-west-1")
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
 # --- Clients ---
@@ -182,13 +182,26 @@ def invoke_agentcore(session_id, action, user_id, actor_id, channel, message=Non
         return {"response": f"Agent invocation failed: {e}"}
 
 
-def warmup_and_wait(session_id, user_id, actor_id, channel):
+def warmup_and_wait(session_id, user_id, actor_id, channel, context=None):
     """Send warmup action and poll until the container is ready.
 
     Returns True if the container is ready, False if warmup timed out.
+    Uses Lambda remaining time if available to avoid exceeding Lambda timeout.
     """
+    # Reserve 120s for the actual cron invocation + response delivery
+    RESERVE_SECONDS = 120
+    if context and hasattr(context, "get_remaining_time_in_millis"):
+        max_wait = min(WARMUP_MAX_WAIT_SECONDS,
+                       (context.get_remaining_time_in_millis() / 1000) - RESERVE_SECONDS)
+    else:
+        max_wait = WARMUP_MAX_WAIT_SECONDS
+
+    if max_wait <= 0:
+        logger.error("Not enough remaining Lambda time for warmup (need %ds reserve)", RESERVE_SECONDS)
+        return False
+
     start = time.time()
-    while time.time() - start < WARMUP_MAX_WAIT_SECONDS:
+    while time.time() - start < max_wait:
         result = invoke_agentcore(session_id, "warmup", user_id, actor_id, channel)
         status = result.get("status", "")
         logger.info("Warmup status: %s (elapsed: %.0fs)", status, time.time() - start)
@@ -570,7 +583,7 @@ def handler(event, context):
     session_id = get_or_create_session(user_id)
 
     # Phase 2: Warm up the container if cold
-    warmup_ok = warmup_and_wait(session_id, user_id, actor_id, channel)
+    warmup_ok = warmup_and_wait(session_id, user_id, actor_id, channel, context=context)
     if not warmup_ok:
         error_msg = (
             f"[Scheduled: {schedule_name or schedule_id}] "

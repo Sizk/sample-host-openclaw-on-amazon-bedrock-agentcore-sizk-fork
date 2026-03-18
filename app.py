@@ -68,7 +68,7 @@ router_stack = RouterStack(
 # --- Cron (EventBridge Scheduler + Lambda executor) ---
 # Use deterministic string ARNs for identity table to avoid cyclic dependency
 # (AgentCore <- Router already exists; CronStack adds policies to AgentCore role)
-_region = env.region or os.environ.get("CDK_DEFAULT_REGION", "us-west-2")
+_region = env.region or os.environ.get("CDK_DEFAULT_REGION", "eu-west-1")
 _account = env.account or os.environ.get("CDK_DEFAULT_ACCOUNT", "")
 _identity_table_name = "openclaw-identity"
 _identity_table_arn = f"arn:aws:dynamodb:{_region}:{_account}:table/{_identity_table_name}"
@@ -88,6 +88,9 @@ cron_stack = CronStack(
     agentcore_execution_role=agentcore_stack.execution_role,
     env=env,
 )
+# Cron stack uses the identity table ARN by string (to avoid cyclic dependency),
+# but it still depends on the router stack creating the actual table.
+cron_stack.add_dependency(router_stack)
 
 # --- Observability (dashboards + alarms) ---
 observability_stack = ObservabilityStack(

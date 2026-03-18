@@ -1649,6 +1649,11 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
+server.on("error", (err) => {
+  console.error(`[contract] FATAL: Server error: ${err.message}`);
+  process.exit(1);
+});
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(
     `[contract] AgentCore contract server listening on http://0.0.0.0:${PORT} (per-user session mode)`,

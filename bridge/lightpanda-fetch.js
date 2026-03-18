@@ -57,10 +57,12 @@ async function ensureLightpandaRunning() {
 
       lightpandaProcess = proc;
       let started = false;
+      let pollInterval = null;
 
       const startTimeout = setTimeout(() => {
         if (!started) {
           console.error("[lightpanda] Start timeout — killing process");
+          if (pollInterval) clearInterval(pollInterval);
           proc.kill("SIGTERM");
           lightpandaStarting = false;
           resolve(false);
@@ -92,7 +94,7 @@ async function ensureLightpandaRunning() {
       });
 
       // Also try polling the server
-      const pollInterval = setInterval(() => {
+      pollInterval = setInterval(() => {
         if (started) {
           clearInterval(pollInterval);
           return;
@@ -159,13 +161,19 @@ async function fetchWithLightpanda(url, options = {}) {
   const ready = await ensureLightpandaRunning();
   if (!ready) return null;
 
-  let browser, page;
+  let browser, page, context;
   try {
     const puppeteer = require("puppeteer-core");
-    browser = await puppeteer.connect({
-      browserWSEndpoint: `ws://127.0.0.1:${LIGHTPANDA_PORT}`,
-    });
-    const context = await browser.createBrowserContext();
+    // Timeout on WebSocket connect to avoid hanging if Lightpanda stalls
+    browser = await Promise.race([
+      puppeteer.connect({
+        browserWSEndpoint: `ws://127.0.0.1:${LIGHTPANDA_PORT}`,
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("CDP connect timeout")), 10000),
+      ),
+    ]);
+    context = await browser.createBrowserContext();
     page = await context.newPage();
 
     // Set reasonable viewport
@@ -211,8 +219,9 @@ async function fetchWithLightpanda(url, options = {}) {
     };
   } catch (err) {
     console.error(`[lightpanda] Fetch failed for ${url}: ${err.message}`);
-    // Clean up on error
+    // Clean up on error (close context to avoid leaks)
     try { if (page) await page.close(); } catch {}
+    try { if (context) await context.close(); } catch {}
     try { if (browser) await browser.disconnect(); } catch {}
     return null;
   }

@@ -17,6 +17,7 @@ import os
 import re
 import time
 import uuid
+from collections import deque
 from urllib import request as urllib_request
 from urllib.parse import quote
 
@@ -35,7 +36,7 @@ TELEGRAM_TOKEN_SECRET_ID = os.environ.get("TELEGRAM_TOKEN_SECRET_ID", "")
 SLACK_TOKEN_SECRET_ID = os.environ.get("SLACK_TOKEN_SECRET_ID", "")
 WEBHOOK_SECRET_ID = os.environ.get("WEBHOOK_SECRET_ID", "")
 LAMBDA_FUNCTION_NAME = os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
-AWS_REGION = os.environ.get("AWS_REGION", "ap-southeast-2")
+AWS_REGION = os.environ.get("AWS_REGION", "eu-west-1")
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "true"
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 
@@ -69,8 +70,8 @@ BIND_CODE_TTL_SECONDS = 600  # 10 minutes
 # webhook twice under network issues even after we return 200. Without dedup,
 # both async-dispatch Lambdas would process the same message.
 _processed_update_ids = set()
-_processed_update_ids_list = []  # maintains insertion order for eviction
 MAX_PROCESSED_UPDATE_IDS = 1000
+_processed_update_ids_deque = deque(maxlen=MAX_PROCESSED_UPDATE_IDS)  # O(1) eviction
 
 
 def _get_secret(secret_id):
@@ -1356,10 +1357,11 @@ def handle_telegram(body):
             logger.info("Telegram: skipping duplicate update_id=%s", update_id)
             return
         _processed_update_ids.add(update_id)
-        _processed_update_ids_list.append(update_id)
-        # Evict oldest entries to prevent unbounded growth
-        while len(_processed_update_ids_list) > MAX_PROCESSED_UPDATE_IDS:
-            old_id = _processed_update_ids_list.pop(0)
+        _processed_update_ids_deque.append(update_id)
+        # Evict oldest entries to keep the set bounded (deque auto-evicts,
+        # but we must also remove from the set)
+        while len(_processed_update_ids) > MAX_PROCESSED_UPDATE_IDS:
+            old_id = _processed_update_ids_deque.popleft()
             _processed_update_ids.discard(old_id)
 
     message = update.get("message", {})
@@ -1762,8 +1764,12 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     elif path.endswith("/webhook/slack"):
+        # Validate Slack request signature before any processing
+        if not validate_slack_webhook(headers, body):
+            logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+
         # Slack requires immediate response for url_verification
-        # (url_verification is not signed — it's part of initial app setup)
         try:
             event_data = json.loads(body) if isinstance(body, str) else body
             if event_data.get("type") == "url_verification":
@@ -1774,11 +1780,6 @@ def handler(event, context):
                 }
         except (json.JSONDecodeError, TypeError):
             pass
-
-        # Validate Slack request signature before processing
-        if not validate_slack_webhook(headers, body):
-            logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
 
         # Ignore Slack retries
         if headers.get("x-slack-retry-num"):

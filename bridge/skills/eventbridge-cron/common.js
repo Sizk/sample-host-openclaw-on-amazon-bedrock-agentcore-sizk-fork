@@ -130,11 +130,15 @@ function buildActorId(channel, channelTarget) {
 }
 
 /**
- * Get a DynamoDB Document Client.
+ * Get a DynamoDB Document Client (cached for connection reuse).
  */
+let _dynamoClient = null;
 function getDynamoClient() {
-  const client = new DynamoDBClient({ region: REGION });
-  return DynamoDBDocumentClient.from(client);
+  if (!_dynamoClient) {
+    const client = new DynamoDBClient({ region: REGION });
+    _dynamoClient = DynamoDBDocumentClient.from(client);
+  }
+  return _dynamoClient;
 }
 
 /**

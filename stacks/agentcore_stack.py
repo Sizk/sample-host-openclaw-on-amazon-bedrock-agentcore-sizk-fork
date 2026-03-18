@@ -352,16 +352,6 @@ class AgentCoreStack(Stack):
             ],
         )
         cdk_nag.NagSuppressions.add_resource_suppressions(
-            self.user_files_bucket,
-            [
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-S1",
-                    reason="Server access logging not required for user file storage — "
-                    "CloudTrail S3 data events provide sufficient audit trail.",
-                ),
-            ],
-        )
-        cdk_nag.NagSuppressions.add_resource_suppressions(
             self.agent_sg,
             [
                 cdk_nag.NagPackSuppression(

@@ -14,3 +14,16 @@ dns.lookup = function(hostname, options, callback) {
   options = Object.assign({}, options, { family: 4 });
   return origLookup.call(dns, hostname, options, callback);
 };
+
+// Also patch dns.promises.lookup — some libraries (undici, fetch) use the
+// promises API which bypasses the callback-based dns.lookup override above.
+if (dns.promises && dns.promises.lookup) {
+  const origPromiseLookup = dns.promises.lookup.bind(dns.promises);
+  dns.promises.lookup = function(hostname, options) {
+    if (typeof options === 'number') {
+      options = { family: options };
+    }
+    options = Object.assign({}, options, { family: 4 });
+    return origPromiseLookup(hostname, options);
+  };
+}
